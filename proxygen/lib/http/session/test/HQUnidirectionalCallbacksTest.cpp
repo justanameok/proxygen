@@ -133,7 +133,7 @@ TEST_F(UnidirectionalReadDispatcherTest,
   dispatcherCallback_->expectOnNewPushStream(
       [&](quic::StreamId id, hq::PushId pushId, size_t consumed) {
         ASSERT_EQ(id, expectedId);
-        ASSERT_EQ(pushId, expectedPushId | hq::kPushIdMask);
+        ASSERT_EQ(pushId, expectedPushId);
         ASSERT_EQ(consumed, atLeastBytes + atLeastBytes);
       });
 
@@ -172,50 +172,4 @@ TEST_F(UnidirectionalReadDispatcherTest, TestRejectUnrecognizedPreface) {
   sendData(expectedId,
            static_cast<uint64_t>(hq::UnidirectionalStreamType::CONTROL),
            atLeastBytes);
-}
-
-TEST_F(UnidirectionalReadDispatcherTest, TestGatingExpired) {
-
-  quic::StreamId expectedId = 5;
-  uint64_t expectedOffset = 65;
-
-  // Enable the partial reliablity
-  dispatcherCallback_->expectIsPartialReliabilityEnabled(
-      [&](quic::StreamId id) -> bool {
-        EXPECT_EQ(expectedId, id);
-        return true;
-      });
-
-  // Expect the "onDataExpired" to be propagated
-  dispatcherCallback_->expectProcessExpiredData(
-      [&](quic::StreamId id, uint64_t offset) {
-        ASSERT_EQ(expectedId, id);
-        ASSERT_EQ(expectedOffset, offset);
-      });
-
-  // Invoke the "expired" and "rejected" callbacks
-  dispatcher_->onDataExpired(expectedId, expectedOffset);
-}
-
-TEST_F(UnidirectionalReadDispatcherTest, TestGatingRejected) {
-
-  quic::StreamId expectedId = 5;
-  uint64_t expectedOffset = 65;
-
-  // Enable the partial reliablity
-  dispatcherCallback_->expectIsPartialReliabilityEnabled(
-      [&](quic::StreamId id) -> bool {
-        EXPECT_EQ(expectedId, id);
-        return true;
-      });
-
-  // Expect the "onDataRejected" to be propagated
-  dispatcherCallback_->expectProcessRejectedData(
-      [&](quic::StreamId id, uint64_t offset) {
-        ASSERT_EQ(expectedId, id);
-        ASSERT_EQ(expectedOffset, offset);
-      });
-
-  // Invoke the "expired" and "rejected" callbacks
-  dispatcher_->onDataRejected(expectedId, expectedOffset);
 }

@@ -118,6 +118,15 @@ class EnableWeakRefCountedPtr {
     return state_->count;
   }
 
+ protected:
+  /**
+   * Called when a WeakRefCountedPtr is created.
+   *
+   * Default implementation is a no-op.
+   */
+  virtual void onWeakRefCountedPtrCreate() {
+  }
+
   /**
    * Called when a WeakRefCountedPtr is destroyed.
    *
@@ -126,6 +135,13 @@ class EnableWeakRefCountedPtr {
    * is met, then no WeakRefCountedPtr remain and destruction can proceed.
    */
   virtual void onWeakRefCountedPtrDestroy() = 0;
+
+  // WeakRefCountedPtr must be a friend so that it can call
+  // onWeakRefCountedPtrDestroy()
+  //
+  // We do not care about its precise template arguments.
+  template <typename T1, typename T2>
+  friend class WeakRefCountedPtr;
 
  private:
   WeakRefCountedPtrState<T>* state_{nullptr};
@@ -188,6 +204,10 @@ class WeakRefCountedPtr {
     return (get());
   }
 
+  void reset() {
+    destroyPtr();
+  }
+
  private:
   WeakRefCountedPtr(WeakRefCountedPtrState<T1>* state) {
     initPtr(state);
@@ -202,6 +222,9 @@ class WeakRefCountedPtr {
     state_ = state;
     if (state_) {
       state_->count++;
+      if (state_->ptr) {
+        state_->ptr->onWeakRefCountedPtrCreate();
+      }
       CHECK_GE(state_->count, 1); // sanity if state_->count is ever unsigned
     }
   }

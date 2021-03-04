@@ -69,9 +69,11 @@ HTTPServer::HTTPServer(HTTPServerOptions options)
     opts.minimumCompressionSize = options_->contentCompressionMinimumSize;
     opts.zlibCompressionLevel = options_->contentCompressionLevel;
     opts.compressibleContentTypes = options_->contentCompressionTypes;
+    opts.enableGzip = options_->enableGzipCompression;
     if (options_->enableZstdCompression) {
       opts.enableZstd = options_->enableZstdCompression;
       opts.independentChunks = options_->useZstdIndependentChunks;
+      opts.zstdCompressionLevel = options_->zstdContentCompressionLevel;
     }
     options_->handlerFactories.insert(
         options_->handlerFactories.begin(),

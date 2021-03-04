@@ -94,6 +94,10 @@ class HTTPSessionAcceptor
     return accConfig_.HTTP2PrioritiesEnabled;
   }
 
+  virtual bool getHttp2PingEnabled() {
+    return accConfig_.HTTP2PingEnabled;
+  }
+
  protected:
   /**
    * This function is invoked when a new session is created to get the
@@ -106,6 +110,8 @@ class HTTPSessionAcceptor
   }
 
   HTTPSessionStats* downstreamSessionStats_{nullptr};
+
+  bool setEnableConnectProtocol_{false};
 
   HTTPSession::InfoCallback* getSessionInfoCallback() {
     return sessionInfoCb_ ? sessionInfoCb_ : this;

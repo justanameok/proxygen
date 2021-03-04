@@ -21,6 +21,7 @@
 #include <folly/io/async/HHWheelTimer.h>
 #include <proxygen/lib/http/HTTPConstants.h>
 #include <proxygen/lib/http/HTTPHeaderSize.h>
+#include <proxygen/lib/http/codec/ControlMessageRateLimitFilter.h>
 #include <proxygen/lib/http/codec/FlowControlFilter.h>
 #include <proxygen/lib/http/codec/HTTPCodec.h>
 #include <proxygen/lib/http/codec/HTTPCodecFilter.h>
@@ -42,13 +43,6 @@ class HTTPSessionStats;
 #define PROXYGEN_HTTP_SESSION_USES_BASE 1
 constexpr uint32_t kDefaultMaxConcurrentOutgoingStreamsRemote = 100000;
 constexpr uint32_t kDefaultMaxConcurrentIncomingStreams = 100;
-
-// These constants define the rate at which we limit certain events.
-constexpr uint32_t kDefaultMaxControlMsgsPerInterval = 50000;
-constexpr uint32_t kDefaultControlMsgDuration = 100; // milliseconds
-
-constexpr uint32_t kDefaultMaxDirectErrorHandlingPerInterval = 100;
-constexpr uint32_t kDefaultDirectErrorHandlingDuration = 100; // milliseconds
 
 class HTTPSession
     : public HTTPSessionBase
@@ -139,8 +133,8 @@ class HTTPSession
     HTTPSessionBase::setHTTP2PrioritiesEnabled(enabled);
   }
 
-  folly::Optional<HTTPTransaction::ConnectionToken> getConnectionToken() const
-      noexcept override {
+  folly::Optional<HTTPTransaction::ConnectionToken> getConnectionToken()
+      const noexcept override {
     return connectionToken_;
   }
 
@@ -172,6 +166,17 @@ class HTTPSession
    * before cutting it off
    */
   void setEgressBytesLimit(uint64_t bytesLimit);
+
+  /**
+   * If set to true, HTTPSession will abort the push streams when receiving
+   * a STREAM_RST on the associated stream.
+   *
+   * This applies to HTTP/2, and it's temporarily available to perform an
+   * experiment.
+   */
+  void setAbortPushesOnRST(bool value) {
+    abortPushesOnRST_ = value;
+  }
 
   /**
    * Start reading from the transport and send any introductory messages
@@ -255,21 +260,14 @@ class HTTPSession
   void setSecondAuthManager(
       std::unique_ptr<SecondaryAuthManagerBase> secondAuthManager);
 
-  void setMaxControlMsgsPerInterval(uint32_t val) {
-    maxControlMsgsPerInterval_ = val;
-  }
-
-  void setControlMsgIntervalDuration(uint32_t val) {
-    controlMsgIntervalDuration_ = val;
-  }
-
-  void setMaxDirectErrorHandlingPerInterval(uint32_t val) {
-    maxDirectErrorHandlingPerInterval_ = val;
-  }
-
-  void setDirectErrorHandlingIntervalDuration(uint32_t val) {
-    directErrorHandlingIntervalDuration_ = val;
-  }
+  void setControlMessageRateLimitParams(
+      uint32_t maxControlMsgsPerInterval = kDefaultMaxControlMsgsPerInterval,
+      uint32_t maxDirectErrorHandlingPerInterval =
+          kDefaultMaxDirectErrorHandlingPerInterval,
+      std::chrono::milliseconds controlMsgIntervalDuration =
+          kDefaultControlMsgDuration,
+      std::chrono::milliseconds directErrorHandlingIntervalDuration =
+          kDefaultDirectErrorHandlingDuration);
 
   /**
    * Get the SecondaryAuthManager attached to this session.
@@ -312,6 +310,11 @@ class HTTPSession
     return writes_ == SocketState::SHUTDOWN;
   }
 
+  void enablePingProbes(std::chrono::seconds interval,
+                        std::chrono::seconds timeout,
+                        bool extendIntervalOnIngress,
+                        bool immediate = false) override;
+
  protected:
   /**
    * HTTPSession is an abstract base class and cannot be instantiated
@@ -320,7 +323,7 @@ class HTTPSession
    * requests and handle responses (act as a client), construct a
    * HTTPUpstreamSession.
    *
-   * @param transactionTimeouts  Timeout for each transaction in the session.
+   * @param wheelTimer  Shared HHWheel Timer instance for scheduling timeouts.
    * @param sock                 An open socket on which any applicable TLS
    *                               handshaking has been completed already.
    * @param localAddr            Address and port of the local end of
@@ -337,7 +340,7 @@ class HTTPSession
    * @param InfoCallback         Optional callback to be informed of session
    *                               lifecycle events.
    */
-  HTTPSession(const WheelTimerInstance& timeout,
+  HTTPSession(const WheelTimerInstance& wheelTimer,
               folly::AsyncTransport::UniquePtr sock,
               const folly::SocketAddress& localAddr,
               const folly::SocketAddress& peerAddr,
@@ -347,7 +350,7 @@ class HTTPSession
               InfoCallback* infoCallback);
 
   // thrift uses WheelTimer
-  HTTPSession(folly::HHWheelTimer* transactionTimeouts,
+  HTTPSession(folly::HHWheelTimer* wheelTimer,
               folly::AsyncTransport::UniquePtr sock,
               const folly::SocketAddress& localAddr,
               const folly::SocketAddress& peerAddr,
@@ -414,7 +417,7 @@ class HTTPSession
                                    std::unique_ptr<HTTPCodec> codec,
                                    const std::string& protocolString);
 
-  virtual folly::Optional<const HTTPMessage::HTTPPriority> getHTTPPriority(
+  virtual folly::Optional<const HTTPMessage::HTTP2Priority> getHTTPPriority(
       uint8_t) override {
     return folly::none;
   }
@@ -470,7 +473,8 @@ class HTTPSession
   void onSettings(const SettingsList& settings) override;
   void onSettingsAck() override;
   void onPriority(HTTPCodec::StreamID stream,
-                  const HTTPMessage::HTTPPriority&) override;
+                  const HTTPMessage::HTTP2Priority&) override;
+  void onPriority(HTTPCodec::StreamID, const HTTPPriority&) override;
   void onCertificateRequest(uint16_t requestId,
                             std::unique_ptr<folly::IOBuf> authRequest) override;
   void onCertificate(uint16_t certId,
@@ -502,6 +506,8 @@ class HTTPSession
                    ErrorCode statusCode) noexcept override;
   size_t sendPriority(HTTPTransaction* txn,
                       const http2::PriorityUpdate& pri) noexcept override;
+  size_t changePriority(HTTPTransaction* /*txn*/,
+                        HTTPPriority /* pri */) noexcept override;
   void detach(HTTPTransaction* txn) noexcept override;
   size_t sendWindowUpdate(HTTPTransaction* txn,
                           uint32_t bytes) noexcept override;
@@ -525,8 +531,8 @@ class HTTPSession
    * Returns the underlying AsyncTransport.
    * Overrides HTTPTransaction::Transport::getUnderlyingTransport().
    */
-  const folly::AsyncTransport* getUnderlyingTransport() const
-      noexcept override {
+  const folly::AsyncTransport* getUnderlyingTransport()
+      const noexcept override {
     return sock_.get();
   }
 
@@ -754,7 +760,9 @@ class HTTPSession
 
   folly::AsyncTransport::UniquePtr sock_;
 
-  WheelTimerInstance timeout_;
+  WheelTimerInstance wheelTimer_;
+
+  ControlMessageRateLimitFilter* controlMessageRateLimitFilter_{nullptr};
 
   /**
    * Number of writes submitted to the transport for which we haven't yet
@@ -903,6 +911,8 @@ class HTTPSession
 
   void scheduleResetDirectErrorHandling();
 
+  size_t sendPing(uint64_t data);
+
   // private members
 
   std::list<ReplaySafetyCallback*> waitingForReplaySafety_;
@@ -955,34 +965,6 @@ class HTTPSession
    * Number of body un-encoded bytes in the write buffer per write iteration.
    */
   uint64_t bodyBytesPerWriteBuf_{0};
-
-  struct RateLimitingCounters {
-    /**
-     * The two variables below keep track of the number of Control messages,
-     * and the number of error handling events that are handled by a newly
-     * created transaction handler seen in the current interval, respectively.
-     * These are shared_ptrs, as opposed to uint64_ts because we don't want to
-     * run into lifetime issues where the HTTPSession is destructed, and the
-     * rate limiting function is still scheduled to run on the event base.
-     */
-    uint64_t numControlMsgsInCurrentInterval{0};
-    uint64_t numDirectErrorHandlingInCurrentInterval{0};
-  };
-
-  std::shared_ptr<RateLimitingCounters> rateLimitingCounters_;
-
-  /*
-   * If the number of control messages in a controlMsgIntervalDuration_
-   * millisecond interval exceeds maxControlMsgsPerInterval_, we drop the
-   * connection
-   */
-  uint32_t maxControlMsgsPerInterval_{kDefaultMaxControlMsgsPerInterval};
-  uint32_t controlMsgIntervalDuration_{kDefaultControlMsgDuration};
-
-  uint32_t maxDirectErrorHandlingPerInterval_{
-      kDefaultMaxDirectErrorHandlingPerInterval};
-  uint32_t directErrorHandlingIntervalDuration_{
-      kDefaultDirectErrorHandlingDuration};
 
   /**
    * Container to hold the results of HTTP2PriorityQueue::nextEgress
@@ -1068,6 +1050,36 @@ class HTTPSession
   };
   DrainTimeout drainTimeout_;
 
+  class PingProber : public folly::HHWheelTimer::Callback {
+   public:
+    PingProber(HTTPSession& session,
+               std::chrono::seconds interval,
+               std::chrono::seconds timeout,
+               bool extendIntervalOnIngress,
+               bool immediate);
+
+    void startProbes();
+
+    void cancelProbes();
+
+    void refreshTimeout(bool onIngress);
+
+    void timeoutExpired() noexcept override;
+
+    void callbackCanceled() noexcept override {
+    }
+
+    void onPingReply(uint64_t data);
+
+   private:
+    HTTPSession& session_;
+    std::chrono::seconds interval_;
+    std::chrono::seconds timeout_;
+    folly::Optional<uint64_t> pingVal_;
+    bool extendIntervalOnIngress_{true};
+  };
+  std::unique_ptr<PingProber> pingProber_;
+
   // secondary authentication manager
   std::unique_ptr<SecondaryAuthManagerBase> secondAuthManager_;
 
@@ -1090,6 +1102,8 @@ class HTTPSession
   bool inResume_ : 1;
   bool pendingPause_ : 1;
   bool writeBufSplit_ : 1;
+
+  bool abortPushesOnRST_{false};
 };
 
 } // namespace proxygen

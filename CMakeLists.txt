@@ -23,6 +23,16 @@ set(CMAKE_MODULE_PATH
   "${CMAKE_CURRENT_SOURCE_DIR}/build/fbcode_builder/CMake"
   ${CMAKE_MODULE_PATH})
 
+option(BUILD_SHARED_LIBS
+  "If enabled, build proxygen as a shared library.  \
+  This is generally discouraged, since proxygen does not commit to having \
+  a stable ABI."
+  OFF
+)
+# Mark BUILD_SHARED_LIBS as an "advanced" option, since enabling it
+# is generally discouraged.
+mark_as_advanced(BUILD_SHARED_LIBS)
+
 include(FBBuildOptions)
 fb_activate_static_library_option()
 
@@ -49,11 +59,17 @@ if(NOT PROXYGEN_GPERF)
 endif()
 
 # Dependencies
+#
+# IMPORTANT: If you change this, make the analogous update in:
+#   cmake/proxygen-config.cmake.in
 find_package(fmt REQUIRED)
 find_package(folly REQUIRED)
 find_package(wangle REQUIRED)
-find_package(Fizz REQUIRED)
-find_package(mvfst QUIET)
+if (BUILD_QUIC)
+  find_package(mvfst REQUIRED)
+else()
+ find_package(Fizz REQUIRED)
+endif()
 find_package(Zstd REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -131,21 +147,29 @@ include(ProxygenTest)
 
 add_subdirectory(proxygen)
 
+if (NOT DEFINED LIB_INSTALL_DIR)
+    set(LIB_INSTALL_DIR "lib")
+endif()
+
+if (NOT DEFINED CMAKE_INSTALL_DIR)
+    set(CMAKE_INSTALL_DIR "${LIB_INSTALL_DIR}/cmake/proxygen/")
+endif()
+
 install(
     EXPORT proxygen-exports
     FILE proxygen-targets.cmake
     NAMESPACE proxygen::
-    DESTINATION lib/cmake/proxygen/
+    DESTINATION ${CMAKE_INSTALL_DIR}
 )
 include(CMakePackageConfigHelpers)
 configure_package_config_file(
     cmake/proxygen-config.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/proxygen-config.cmake
-    INSTALL_DESTINATION lib/cmake/proxygen/
+    INSTALL_DESTINATION ${CMAKE_INSTALL_DIR}
 )
 install(
     FILES ${CMAKE_CURRENT_BINARY_DIR}/proxygen-config.cmake
-    DESTINATION lib/cmake/proxygen/
+    DESTINATION ${CMAKE_INSTALL_DIR}
 )
 
 # uninstall target

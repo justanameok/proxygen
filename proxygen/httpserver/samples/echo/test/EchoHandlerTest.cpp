@@ -7,6 +7,7 @@
  */
 
 #include <proxygen/httpserver/samples/echo/EchoHandler.h>
+
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
 #include <proxygen/httpserver/Mocks.h>
@@ -54,8 +55,8 @@ TEST_F(EchoHandlerFixture, OnProperRequestSendsResponse) {
       .WillOnce(DoAll(SaveArg<0>(&response), Return()));
   EXPECT_CALL(*responseHandler, sendEOM()).WillOnce(Return());
 
-  // Since we know we dont touch request, its ok to pass `nullptr` here.
-  handler->onRequest(nullptr);
+  // Since we know we dont touch request, its ok to pass an empty message here.
+  handler->onRequest(std::make_unique<HTTPMessage>());
   handler->onEOM();
   handler->requestComplete();
 
@@ -81,8 +82,8 @@ TEST_F(EchoHandlerFixture, ReplaysBodyProperly) {
 
   EXPECT_CALL(*responseHandler, sendEOM()).WillOnce(Return());
 
-  // Since we know we dont touch request, its ok to pass `nullptr` here.
-  handler->onRequest(nullptr);
+  // Since we know we dont touch request, its ok to pass an empty message here.
+  handler->onRequest(std::make_unique<HTTPMessage>());
   handler->onBody(folly::IOBuf::copyBuffer("part1"));
   handler->onBody(folly::IOBuf::copyBuffer("part2"));
   handler->onEOM();

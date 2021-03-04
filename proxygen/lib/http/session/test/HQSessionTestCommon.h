@@ -48,7 +48,6 @@ struct PartiallyReliableTestParams {
 struct TestParams {
   std::string alpn_;
   bool shouldSendSettings_{true};
-  folly::Optional<PartiallyReliableTestParams> prParams;
   uint64_t unidirectionalStreamsCredit{kDefaultUnidirStreamCredit};
   std::size_t numBytesOnPushStream{kUnlimited};
   bool expectOnTransportReady{true};
@@ -122,19 +121,18 @@ class HQSessionTest
     if (!IS_H1Q_FB_V1) {
       egressControlCodec_ = std::make_unique<proxygen::hq::HQControlCodec>(
           nextUnidirectionalStreamId_,
-          direction_,
+          direction_ == proxygen::TransportDirection::DOWNSTREAM
+              ? proxygen::TransportDirection::UPSTREAM
+              : proxygen::TransportDirection::DOWNSTREAM,
           proxygen::hq::StreamDirection::EGRESS,
           egressSettings_);
     }
     socketDriver_ = std::make_unique<quic::MockQuicSocketDriver>(
         &eventBase_,
         *hqSession_,
-        hqSession_->getDispatcher(),
-        hqSession_->getDispatcher(),
         direction_ == proxygen::TransportDirection::DOWNSTREAM
             ? quic::MockQuicSocketDriver::TransportEnum::SERVER
-            : quic::MockQuicSocketDriver::TransportEnum::CLIENT,
-        GetParam().prParams.has_value());
+            : quic::MockQuicSocketDriver::TransportEnum::CLIENT);
 
     hqSession_->setSocket(socketDriver_->getSocket());
 
@@ -167,30 +165,10 @@ class HQSessionTest
       }
     }
 
-    quic::QuicSocket::TransportInfo transportInfo = {
-        .srtt = std::chrono::microseconds(100),
-        .rttvar = std::chrono::microseconds(0),
-        .lrtt = std::chrono::microseconds(0),
-        .mrtt = std::chrono::microseconds(0),
-        .mss = quic::kDefaultUDPSendPacketLen,
-        .congestionControlType = quic::CongestionControlType::None,
-        .writableBytes = 0,
-        .congestionWindow = 1500,
-        .pacingBurstSize = 0,
-        .pacingInterval = std::chrono::microseconds(0),
-        .packetsRetransmitted = 0,
-        .packetsSpuriouslyLost = 0,
-        .timeoutBasedLoss = 0,
-        .pto = std::chrono::microseconds(0),
-        .bytesSent = 0,
-        .bytesAcked = 0,
-        .bytesRecvd = 0,
-        .totalBytesRetransmitted = 0,
-        .ptoCount = 0,
-        .totalPTOCount = 0,
-        .largestPacketAckedByPeer = 0,
-        .largestPacketSent = 0,
-    };
+    quic::QuicSocket::TransportInfo transportInfo;
+    transportInfo.srtt = std::chrono::microseconds(100);
+    transportInfo.congestionWindow = 1500;
+
     EXPECT_CALL(*socketDriver_->getSocket(), getTransportInfo())
         .WillRepeatedly(testing::Return(transportInfo));
   }
@@ -277,16 +255,11 @@ class HQSessionTest
         case proxygen::hq::UnidirectionalStreamType::QPACK_DECODER:
           break;
         case proxygen::hq::UnidirectionalStreamType::PUSH: {
-          auto pushIt = std::find_if(
-              pushes_.begin(),
-              pushes_.end(),
-              [id](std::pair<quic::StreamId, proxygen::hq::PushId> entry) {
-                return id == entry.first;
-              });
+          auto pushIt = pushes_.find(id);
           if (pushIt == pushes_.end()) {
             auto pushId = quic::decodeQuicInteger(cursor);
             if (pushId) {
-              pushes_.emplace(pushId->first, id);
+              pushes_.emplace(id, pushId->first);
             }
           }
         }
@@ -415,5 +388,5 @@ class HQSessionTest
   quic::StreamId nextUnidirectionalStreamId_;
   // Egress Control Stream
   std::unique_ptr<proxygen::hq::HQControlCodec> egressControlCodec_;
-  folly::F14FastMap<proxygen::hq::PushId, quic::StreamId> pushes_;
+  folly::F14FastMap<quic::StreamId, proxygen::hq::PushId> pushes_;
 };

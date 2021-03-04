@@ -160,7 +160,7 @@ class HQUpstreamSession : public HQSession {
                  << " txn=" << txn_ << " pushID=" << pushId
                  << " parentTxnId=" << parentTxnId;
       session_.dropConnectionAsync(
-          std::make_pair(HTTP3::ErrorCode::HTTP_WRONG_STREAM,
+          std::make_pair(HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED,
                          "Push promise on push stream"),
           kErrorConnection);
     }
@@ -171,7 +171,7 @@ class HQUpstreamSession : public HQSession {
       // TBD: send "cancel push" here.
 
       return sendAbortImpl(
-          hq::toHTTP3ErrorCode(errorCode),
+          toHTTP3ErrorCode(errorCode),
           folly::to<std::string>("Application aborts pushed txn,"
                                  " errorCode=",
                                  getErrorCodeString(errorCode),
@@ -262,10 +262,6 @@ class HQUpstreamSession : public HQSession {
   std::chrono::milliseconds connectTimeoutMs_;
   ConnectTimeout connectTimeout_;
   ConnCallbackState connCbState_{ConnCallbackState::NONE};
-
-  // Lookup maps for matching ingress push streams to push ids
-  folly::F14FastMap<hq::PushId, quic::StreamId> pushIdToStreamId_;
-  folly::F14FastMap<quic::StreamId, hq::PushId> streamIdToPushId_;
 };
 
 } // namespace proxygen

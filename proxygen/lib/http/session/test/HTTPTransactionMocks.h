@@ -63,6 +63,8 @@ class MockHTTPTransactionTransport : public HTTPTransaction::Transport {
                  ,
                  sendPriority,
                  size_t(HTTPTransaction*, const http2::PriorityUpdate&));
+  GMOCK_METHOD2_(
+      , noexcept, , changePriority, size_t(HTTPTransaction*, HTTPPriority));
   GMOCK_METHOD0_(, noexcept, , notifyPendingEgress, void());
   GMOCK_METHOD1_(, noexcept, , detach, void(HTTPTransaction*));
   GMOCK_METHOD2_(
@@ -144,8 +146,8 @@ class MockHTTPTransactionTransport : public HTTPTransaction::Transport {
                  ,
                  getUnderlyingTransportNonConst,
                  const folly::AsyncTransport*());
-  const folly::AsyncTransport* getUnderlyingTransport() const
-      noexcept override {
+  const folly::AsyncTransport* getUnderlyingTransport()
+      const noexcept override {
     return const_cast<MockHTTPTransactionTransport*>(this)
         ->getUnderlyingTransportNonConst();
   }
@@ -153,8 +155,9 @@ class MockHTTPTransactionTransport : public HTTPTransaction::Transport {
   MOCK_METHOD1(setHTTP2PrioritiesEnabled, void(bool));
   MOCK_CONST_METHOD0(getHTTP2PrioritiesEnabled, bool());
 
-  MOCK_METHOD1(getHTTPPriority,
-               folly::Optional<const HTTPMessage::HTTPPriority>(uint8_t level));
+  MOCK_METHOD1(
+      getHTTPPriority,
+      folly::Optional<const HTTPMessage::HTTP2Priority>(uint8_t level));
 
   MOCK_METHOD1(
       peek,
@@ -164,21 +167,13 @@ class MockHTTPTransactionTransport : public HTTPTransaction::Transport {
 
   MOCK_METHOD1(consume, folly::Expected<folly::Unit, ErrorCode>(size_t));
 
-  MOCK_METHOD2(skipBodyTo,
-               folly::Expected<folly::Optional<uint64_t>, ErrorCode>(
-                   HTTPTransaction*, uint64_t));
-
-  MOCK_METHOD2(rejectBodyTo,
-               folly::Expected<folly::Optional<uint64_t>, ErrorCode>(
-                   HTTPTransaction*, uint64_t));
-
   GMOCK_METHOD0_(,
                  noexcept,
                  ,
                  getConnectionTokenNonConst,
                  folly::Optional<HTTPTransaction::ConnectionToken>());
-  folly::Optional<HTTPTransaction::ConnectionToken> getConnectionToken() const
-      noexcept override {
+  folly::Optional<HTTPTransaction::ConnectionToken> getConnectionToken()
+      const noexcept override {
     return const_cast<MockHTTPTransactionTransport*>(this)
         ->getConnectionTokenNonConst();
   }
@@ -333,6 +328,7 @@ class MockHTTPTransaction : public HTTPTransaction {
                void(folly::AsyncTransport::ReplaySafetyCallback*));
   MOCK_METHOD1(removeWaitingForReplaySafety,
                void(folly::AsyncTransport::ReplaySafetyCallback*));
+  MOCK_METHOD2(updateAndSendPriority, void(uint8_t, bool));
 
   void enablePush() {
     EXPECT_CALL(mockCodec_, supportsPushTransactions())

@@ -148,7 +148,7 @@ FizzServerContextPtr createFizzServerContext(const HQParams& params) {
     folly::readFile(params.keyFilePath.c_str(), keyData);
   }
   auto cert = fizz::CertUtils::makeSelfCert(certData, keyData);
-  auto certManager = std::make_unique<fizz::server::CertManager>();
+  auto certManager = std::make_shared<fizz::server::CertManager>();
   certManager->addCert(std::move(cert), true);
 
   auto cert2 =
@@ -156,9 +156,10 @@ FizzServerContextPtr createFizzServerContext(const HQParams& params) {
   certManager->addCert(std::move(cert2), false);
 
   auto serverCtx = std::make_shared<fizz::server::FizzServerContext>();
-  serverCtx->setCertManager(std::move(certManager));
+  serverCtx->setCertManager(certManager);
   auto ticketCipher = std::make_shared<fizz::server::Aead128GCMTicketCipher<
-      fizz::server::TicketCodec<fizz::server::CertificateStorage::X509>>>();
+      fizz::server::TicketCodec<fizz::server::CertificateStorage::X509>>>(
+      serverCtx->getFactoryPtr(), std::move(certManager));
   std::array<uint8_t, 32> ticketSeed;
   folly::Random::secureRandom(ticketSeed.data(), ticketSeed.size());
   ticketCipher->setTicketSecrets({{folly::range(ticketSeed)}});
@@ -205,7 +206,8 @@ FizzClientContextPtr createFizzClientContext(const HQParams& params) {
 wangle::SSLContextConfig createSSLContext(const HQParams& params) {
   wangle::SSLContextConfig sslCfg;
   sslCfg.isDefault = true;
-  sslCfg.clientVerification = folly::SSLContext::SSLVerifyPeerEnum::VERIFY;
+  sslCfg.clientVerification =
+      folly::SSLContext::VerifyClientCertificate::IF_PRESENTED;
   if (!params.certificateFilePath.empty() && !params.keyFilePath.empty()) {
     sslCfg.setCertificate(params.certificateFilePath, params.keyFilePath, "");
   } else {

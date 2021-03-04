@@ -34,11 +34,12 @@ extern const uint64_t kDefaultEgressNumPlaceHolders;
 extern const uint64_t kDefaultEgressMaxHeaderListSize;
 extern const uint64_t kDefaultEgressQpackBlockedStream;
 
+// The maximum client initiated bidirectional stream id in a quic varint
+constexpr uint64_t kMaxClientBidiStreamId = quic::kEightByteLimit - 3;
+// The maximum server initiated push id in a quic varint
+constexpr uint64_t kMaxPushId = quic::kEightByteLimit - 1;
+
 proxygen::ErrorCode hqToHttpErrorCode(HTTP3::ErrorCode err);
-
-HTTP3::ErrorCode toHTTP3ErrorCode(proxygen::ErrorCode err);
-
-HTTP3::ErrorCode toHTTP3ErrorCode(const HTTPException& ex);
 
 /**
  * Conver a quic error to the appropriate proxygen error.

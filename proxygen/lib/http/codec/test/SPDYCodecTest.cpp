@@ -7,6 +7,7 @@
  */
 
 #include <proxygen/lib/http/codec/SPDYCodec.h>
+
 #include <folly/portability/GTest.h>
 #include <proxygen/lib/http/HTTPHeaderSize.h>
 #include <proxygen/lib/http/HTTPMessage.h>
@@ -1361,7 +1362,7 @@ TEST_F(SPDYCodecTestF, GoawayHandling) {
   upstreamCodec_.generateBody(
       output_, 3, makeBuf(10), HTTPCodec::NoPadding, false);
   upstreamCodec_.generatePriority(
-      output_, 3, HTTPMessage::HTTPPriority(0, true, 1));
+      output_, 3, HTTPMessage::HTTP2Priority(0, true, 1));
   upstreamCodec_.generateEOM(output_, 3);
   upstreamCodec_.generateRstStream(output_, 3, ErrorCode::CANCEL);
   EXPECT_EQ(output_.chainLength(), 0);
@@ -1382,7 +1383,7 @@ TEST_F(SPDYCodecTestF, GoawayHandling) {
   parseUpstream();
 
   downstreamCodec_.generatePriority(
-      output_, 2, HTTPMessage::HTTPPriority(0, true, 1));
+      output_, 2, HTTPMessage::HTTP2Priority(0, true, 1));
   downstreamCodec_.generateEOM(output_, 2);
   downstreamCodec_.generateRstStream(output_, 2, ErrorCode::CANCEL);
 
@@ -1395,4 +1396,21 @@ TEST_F(SPDYCodecTestF, GoawayHandling) {
   // parse the remainder
   parseUpstream();
   callbacks_.expectMessage(true, 1, 200);
+}
+
+TEST_F(SPDYCodecTestF, ExtraHeadersDownstream) {
+  HTTPMessage resp;
+  resp.setStatusCode(200);
+  HTTPHeaders extraHeaders;
+  extraHeaders.add(HTTP_HEADER_PRIORITY, "u=3");
+  downstreamCodec_.generateHeader(output_,
+                                  1,
+                                  resp,
+                                  true,
+                                  nullptr /* HeaderSize */,
+                                  std::move(extraHeaders));
+  // parse the remainder
+  parseUpstream();
+  const auto headers = callbacks_.msg->getHeaders();
+  EXPECT_EQ("u=3", headers.getSingleOrEmpty(HTTP_HEADER_PRIORITY));
 }

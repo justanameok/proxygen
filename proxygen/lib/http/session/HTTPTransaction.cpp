@@ -36,14 +36,15 @@ HTTPTransaction::HTTPTransaction(
     Transport& transport,
     HTTP2PriorityQueueBase& egressQueue,
     folly::HHWheelTimer* timer,
-    const folly::Optional<std::chrono::milliseconds>& defaultTimeout,
+    const folly::Optional<std::chrono::milliseconds>& defaultIdleTimeout,
     HTTPSessionStats* stats,
     bool useFlowControl,
     uint32_t receiveInitialWindowSize,
     uint32_t sendInitialWindowSize,
     http2::PriorityUpdate priority,
     folly::Optional<HTTPCodec::StreamID> assocId,
-    folly::Optional<HTTPCodec::ExAttributes> exAttributes)
+    folly::Optional<HTTPCodec::ExAttributes> exAttributes,
+    bool setIngressTimeoutAfterEom)
     : deferredEgressBody_(folly::IOBufQueue::cacheChainLength()),
       direction_(direction),
       id_(id),
@@ -72,9 +73,11 @@ HTTPTransaction::HTTPTransaction(
       headRequest_(false),
       enableLastByteFlushedTracking_(false),
       enableBodyLastByteDeliveryTracking_(false),
-      transactionTimeout_(defaultTimeout),
-      timer_(timer) {
-
+      partiallyReliable_(false),
+      egressHeadersDelivered_(false),
+      idleTimeout_(defaultIdleTimeout),
+      timer_(timer),
+      setIngressTimeoutAfterEom_(setIngressTimeoutAfterEom) {
   if (assocStreamId_) {
     if (isUpstream()) {
       egressState_ = HTTPTransactionEgressSM::State::SendingDone;
@@ -94,13 +97,15 @@ HTTPTransaction::HTTPTransaction(
     }
   }
 
-  refreshTimeout();
+  updateReadTimeout();
   if (stats_) {
     stats_->recordTransactionOpened();
   }
 
-  queueHandle_ =
-      egressQueue_.addTransaction(id_, priority, this, false, &insertDepth_);
+  if (direction_ == TransportDirection::DOWNSTREAM || !isPushed()) {
+    queueHandle_ =
+        egressQueue_.addTransaction(id_, priority, this, false, &insertDepth_);
+  }
   if (priority.streamDependency != egressQueue_.getRootId() &&
       insertDepth_ == 1) {
     priorityFallback_ = true;
@@ -143,7 +148,9 @@ HTTPTransaction::~HTTPTransaction() {
   }
   // TODO: handle the case where the priority node hangs out longer than
   // the transaction
-  egressQueue_.removeTransaction(queueHandle_);
+  if (queueHandle_) {
+    egressQueue_.removeTransaction(queueHandle_);
+  }
 }
 
 void HTTPTransaction::reset(bool useFlowControl,
@@ -442,12 +449,6 @@ void HTTPTransaction::onIngressEOM() {
     return;
   }
 
-  // TODO: change the codec to not give an EOM callback after a 100 response?
-  // We could then delete the below 'if'
-  if (isUpstream() && extraResponseExpected()) {
-    VLOG(4) << "Ignoring EOM on initial 100 response on " << *this;
-    return;
-  }
   if (!validateIngressStateTransition(HTTPTransactionIngressSM::Event::onEOM)) {
     return;
   }
@@ -492,7 +493,12 @@ bool HTTPTransaction::isExpectingWindowUpdate() const {
 }
 
 bool HTTPTransaction::isExpectingIngress() const {
-  return isExpectingWindowUpdate() || (!ingressPaused_ && !isIngressEOMSeen());
+  bool upstreamSendingDone = true;
+  if (setIngressTimeoutAfterEom_) {
+    upstreamSendingDone = isDownstream() || isEgressComplete();
+  }
+  return isExpectingWindowUpdate() ||
+         (!ingressPaused_ && !isIngressEOMSeen() && upstreamSendingDone);
 }
 
 void HTTPTransaction::updateReadTimeout() {
@@ -797,35 +803,6 @@ void HTTPTransaction::onIngressBodyPeek(uint64_t bodyOffset,
   }
 }
 
-void HTTPTransaction::onIngressBodySkipped(uint64_t nextBodyOffset) {
-  FOLLY_SCOPED_TRACE_SECTION("HTTPTransaction - onIngressBodySkipped");
-  CHECK_LE(ingressBodyOffset_, nextBodyOffset);
-
-  uint64_t skipLen = nextBodyOffset - ingressBodyOffset_;
-  if (!updateContentLengthRemaining(skipLen)) {
-    return;
-  }
-  ingressBodyOffset_ = nextBodyOffset;
-
-  DestructorGuard g(this);
-  if (handler_) {
-    handler_->onBodySkipped(nextBodyOffset);
-  }
-}
-
-void HTTPTransaction::onIngressBodyRejected(uint64_t nextBodyOffset) {
-  FOLLY_SCOPED_TRACE_SECTION("HTTPTransaction - onIngressBodyRejected");
-  DestructorGuard g(this);
-  if (nextBodyOffset <= *actualResponseLength_) {
-    return;
-  }
-  actualResponseLength_ = nextBodyOffset;
-
-  if (handler_) {
-    handler_->onBodyRejected(nextBodyOffset);
-  }
-}
-
 void HTTPTransaction::sendHeadersWithOptionalEOM(const HTTPMessage& headers,
                                                  bool eom) {
   CHECK(HTTPTransactionEgressSM::transit(
@@ -866,6 +843,7 @@ void HTTPTransaction::sendHeadersWithOptionalEOM(const HTTPMessage& headers,
     }
     CHECK(HTTPTransactionEgressSM::transit(
         egressState_, HTTPTransactionEgressSM::Event::eomFlushed));
+    updateReadTimeout();
   }
   flushWindowUpdate();
 }
@@ -954,15 +932,9 @@ size_t HTTPTransaction::sendDeferredBody(const uint32_t maxEgress) {
   if (chunkHeaders_.empty()) {
     curLen = canSend;
     std::unique_ptr<IOBuf> body = deferredEgressBody_.split(curLen);
-    willSendEOM = hasPendingEOM();
     DCHECK(curLen > 0 || willSendEOM);
     if (curLen > 0) {
-      if (willSendEOM) {
-        // we have to dequeue BEFORE sending the EOM =(
-        dequeue();
-      }
-      nbytes = sendBodyNow(std::move(body), curLen, willSendEOM);
-      willSendEOM = false;
+      nbytes = sendBodyNow(std::move(body), curLen, hasPendingEOM());
     } // else we got called with only a pending EOM, handled below
   } else {
     // This body is expliticly chunked
@@ -1063,6 +1035,7 @@ size_t HTTPTransaction::sendEOMNow() {
       egressState_, HTTPTransactionEgressSM::Event::eomFlushed));
   size_t nbytes = transport_.sendEOM(this, trailers_.get());
   trailers_.reset();
+  updateReadTimeout();
   return nbytes;
 }
 
@@ -1108,7 +1081,7 @@ size_t HTTPTransaction::sendBodyNow(std::unique_ptr<folly::IOBuf> body,
                                sendEom && !trailers_,
                                enableLastByteFlushedTracking_);
   if (sendEom && trailers_) {
-    sendEOMNow();
+    nbytes += sendEOMNow();
   }
   if (isPrioritySampled()) {
     updateTransactionBytesSent(bodyLen);
@@ -1223,67 +1196,6 @@ folly::Expected<folly::Unit, ErrorCode> HTTPTransaction::peek(
 folly::Expected<folly::Unit, ErrorCode> HTTPTransaction::consume(
     size_t amount) {
   return transport_.consume(amount);
-}
-
-folly::Expected<folly::Optional<uint64_t>, ErrorCode>
-HTTPTransaction::skipBodyTo(uint64_t nextBodyOffset) {
-  if (!partiallyReliable_) {
-    LOG(ERROR) << __func__
-               << ": not permitted on non-partially reliable transaction.";
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_ERROR);
-  }
-
-  if (!egressHeadersDelivered_) {
-    LOG(ERROR) << __func__
-               << ": cannot send data expired before egress headers have been "
-                  "delivered.";
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_ERROR);
-  }
-
-  // Trim buffered egress body to nextBodyOffset.
-  trimDeferredEgressBody(nextBodyOffset);
-
-  if (nextBodyOffset > actualResponseLength_.value()) {
-    actualResponseLength_ = nextBodyOffset;
-  }
-  return transport_.skipBodyTo(this, nextBodyOffset);
-}
-
-folly::Expected<folly::Optional<uint64_t>, ErrorCode>
-HTTPTransaction::rejectBodyTo(uint64_t nextBodyOffset) {
-  if (!partiallyReliable_) {
-    LOG(ERROR) << __func__
-               << ": not permitted on non-partially reliable transaction.";
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_ERROR);
-  }
-
-  if (expectedIngressContentLength_ && expectedIngressContentLengthRemaining_) {
-    if (nextBodyOffset > *expectedIngressContentLength_) {
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_ERROR);
-    }
-
-    auto currentBodyOffset = *expectedIngressContentLength_ -
-                             *expectedIngressContentLengthRemaining_;
-
-    if (nextBodyOffset <= currentBodyOffset) {
-      return folly::makeUnexpected(ErrorCode::PROTOCOL_ERROR);
-    }
-
-    expectedIngressContentLengthRemaining_ =
-        *expectedIngressContentLength_ - nextBodyOffset;
-  }
-
-  if (nextBodyOffset <= ingressBodyOffset_) {
-    // Do not allow rejecting below already received body offset.
-    LOG(ERROR) << ": cannot reject body below already received offset; "
-                  "current received offset = "
-               << ingressBodyOffset_
-               << "; provided reject offset = " << nextBodyOffset;
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_ERROR);
-  }
-  ingressBodyOffset_ = nextBodyOffset;
-
-  return transport_.rejectBodyTo(this, nextBodyOffset);
 }
 
 folly::Optional<HTTPTransaction::ConnectionToken>
@@ -1402,6 +1314,7 @@ void HTTPTransaction::setEgressRateLimit(uint64_t bitsPerSecond) {
 
 void HTTPTransaction::notifyTransportPendingEgress() {
   DestructorGuard guard(this);
+  CHECK(queueHandle_);
   if (!egressRateLimited_ &&
       (deferredEgressBody_.chainLength() > 0 || isEgressEOMQueued()) &&
       (!useFlowControl_ || sendWindow_.getSize() > 0)) {
@@ -1518,14 +1431,12 @@ bool HTTPTransaction::onExTransaction(HTTPTransaction* exTxn) {
   return true;
 }
 
-void HTTPTransaction::setIdleTimeout(
-    std::chrono::milliseconds transactionTimeout) {
-  transactionTimeout_ = transactionTimeout;
-  VLOG(4) << "HTTPTransaction: transaction timeout is set to  "
-          << std::chrono::duration_cast<std::chrono::milliseconds>(
-                 transactionTimeout)
+void HTTPTransaction::setIdleTimeout(std::chrono::milliseconds idleTimeout) {
+  idleTimeout_ = idleTimeout;
+  VLOG(4) << "HTTPTransaction: idle timeout is set to  "
+          << std::chrono::duration_cast<std::chrono::milliseconds>(idleTimeout)
                  .count();
-  refreshTimeout();
+  updateReadTimeout();
 }
 
 void HTTPTransaction::describe(std::ostream& os) const {
@@ -1586,7 +1497,9 @@ void HTTPTransaction::updateAndSendPriority(int8_t newPriority) {
   CHECK_GE(newPriority, 0);
   priority_.streamDependency =
       transport_.getCodec().mapPriorityToDependency(newPriority);
-  queueHandle_ = egressQueue_.updatePriority(queueHandle_, priority_);
+  if (queueHandle_) {
+    queueHandle_ = egressQueue_.updatePriority(queueHandle_, priority_);
+  }
   transport_.sendPriority(this, priority_);
 }
 
@@ -1596,9 +1509,19 @@ void HTTPTransaction::updateAndSendPriority(
   transport_.sendPriority(this, priority_);
 }
 
-void HTTPTransaction::onPriorityUpdate(const http2::PriorityUpdate& priority) {
-  priority_ = priority;
+void HTTPTransaction::updateAndSendPriority(uint8_t urgency, bool incremental) {
+  urgency = HTTPMessage::normalizePriority((int8_t)urgency);
+  CHECK_GE(urgency, 0);
+  // Note we no longer want to play with the egressQueue_ with the new API.
+  transport_.changePriority(this, HTTPPriority(urgency, incremental));
+}
 
+void HTTPTransaction::onPriorityUpdate(const http2::PriorityUpdate& priority) {
+  if (!queueHandle_) {
+    LOG(ERROR) << "Received priority update on ingress only transaction";
+    return;
+  }
+  priority_ = priority;
   queueHandle_ =
       egressQueue_.updatePriority(queueHandle_, priority_, &currentDepth_);
   if (priority_.streamDependency != egressQueue_.getRootId() &&
@@ -1726,8 +1649,10 @@ void HTTPTransaction::setPrioritySampled(bool sampled) {
 
 void HTTPTransaction::updateContentionsCount(uint64_t contentions) {
   CHECK(prioritySample_);
-  prioritySample_->updateContentionsCount(contentions,
-                                          queueHandle_->calculateDepth(false));
+  if (LIKELY(queueHandle_ != nullptr)) {
+    prioritySample_->updateContentionsCount(
+        contentions, queueHandle_->calculateDepth(false));
+  }
 }
 
 void HTTPTransaction::updateRelativeWeight(double ratio) {

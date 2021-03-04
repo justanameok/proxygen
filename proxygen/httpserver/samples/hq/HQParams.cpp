@@ -281,7 +281,6 @@ void initializeTransportSettings(HQParams& hqParams) {
       std::chrono::microseconds(FLAGS_quic_thread_local_delay_us);
   hqParams.transportSettings.maxBatchSize = FLAGS_quic_batch_size;
   hqParams.transportSettings.turnoffPMTUD = true;
-  hqParams.transportSettings.partialReliabilityEnabled = FLAGS_use_pr;
   if (hqParams.mode == HQMode::CLIENT) {
     // There is no good reason to keep the socket around for a drain period for
     // a commandline client
@@ -297,6 +296,10 @@ void initializeTransportSettings(HQParams& hqParams) {
   }
   if (FLAGS_rate_limit > 0) {
     hqParams.rateLimitPerThread = FLAGS_rate_limit;
+
+    std::array<uint8_t, kRetryTokenSecretLength> secret;
+    folly::Random::secureRandom(secret.data(), secret.size());
+    hqParams.transportSettings.retryTokenSecret = secret;
   }
   hqParams.connectTimeout = std::chrono::milliseconds(FLAGS_connect_timeout);
   hqParams.ccpConfig = FLAGS_ccp_config;
@@ -325,7 +328,6 @@ void initializeTransportSettings(HQParams& hqParams) {
   hqParams.transportSettings.shouldUseRecvmmsgForBatchRecv = true;
   hqParams.transportSettings.advertisedInitialMaxStreamsBidi = 100;
   hqParams.transportSettings.advertisedInitialMaxStreamsUni = 100;
-  hqParams.transportSettings.tokenlessPacer = true;
 } // initializeTransportSettings
 
 void initializeHttpSettings(HQParams& hqParams) {
@@ -360,13 +362,6 @@ void initializeHttpSettings(HQParams& hqParams) {
   hqParams.migrateClient = FLAGS_migrate_client;
 
 } // initializeHttpSettings
-
-void initializePartialReliabilitySettings(HQParams& hqParams) {
-  hqParams.partialReliabilityEnabled = FLAGS_use_pr;
-  hqParams.prChunkSize = folly::to<uint64_t>(FLAGS_pr_chunk_size);
-  // TODO: use chrono instead of uint64_t
-  hqParams.prChunkDelayMs = folly::to<uint64_t>(FLAGS_pr_chunk_delay_ms);
-} // initializePartialReliabilitySettings
 
 void initializeQLogSettings(HQParams& hqParams) {
   hqParams.qLoggerPath = FLAGS_qlogger_path;
@@ -515,8 +510,6 @@ HQParamsBuilderFromCmdline::HQParamsBuilderFromCmdline(
 
   initializeHttpSettings(hqParams_);
 
-  initializePartialReliabilitySettings(hqParams_);
-
   initializeQLogSettings(hqParams_);
 
   initializeFizzSettings(hqParams_);
@@ -532,8 +525,8 @@ bool HQParamsBuilderFromCmdline::valid() const noexcept {
   return invalidParams_.empty();
 }
 
-const HQInvalidParams& HQParamsBuilderFromCmdline::invalidParams() const
-    noexcept {
+const HQInvalidParams& HQParamsBuilderFromCmdline::invalidParams()
+    const noexcept {
   return invalidParams_;
 }
 

@@ -7,6 +7,7 @@
  */
 
 #include <proxygen/lib/utils/ParseURL.h>
+
 #include <folly/portability/GTest.h>
 
 using proxygen::ParseURL;
@@ -221,4 +222,10 @@ TEST(ParseURL, IsHostIPAddress) {
   // invalid url
   testHostIsIpAddress("", false);
   testHostIsIpAddress("127.0.0.1:80/foo#bar?qqq", false);
+}
+
+TEST(ParseURL, PortOverflow) {
+  std::string url("http://foo:12345");
+  ParseURL u(folly::StringPiece(url.data(), url.size() - 4));
+  EXPECT_EQ(u.port(), 1);
 }

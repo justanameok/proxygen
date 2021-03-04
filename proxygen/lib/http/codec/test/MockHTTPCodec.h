@@ -37,12 +37,13 @@ class MockHTTPCodec : public HTTPCodec {
   MOCK_CONST_METHOD0(closeOnEgressComplete, bool());
   MOCK_CONST_METHOD0(supportsParallelRequests, bool());
   MOCK_CONST_METHOD0(supportsPushTransactions, bool());
-  MOCK_METHOD5(generateHeader,
+  MOCK_METHOD6(generateHeader,
                void(folly::IOBufQueue&,
                     HTTPCodec::StreamID,
                     const HTTPMessage&,
                     bool eom,
-                    HTTPHeaderSize*));
+                    HTTPHeaderSize*,
+                    folly::Optional<HTTPHeaders>));
   MOCK_METHOD6(generatePushPromise,
                void(folly::IOBufQueue&,
                     HTTPCodec::StreamID,
@@ -162,7 +163,6 @@ class MockHTTPCodecCallback : public HTTPCodec::Callback {
               uint16_t padding) override {
     onBody(stream, std::shared_ptr<folly::IOBuf>(chain.release()), padding);
   }
-  MOCK_METHOD2(onUnframedBodyStarted, void(HTTPCodec::StreamID, uint64_t));
   MOCK_METHOD2(onChunkHeader, void(HTTPCodec::StreamID, size_t));
   MOCK_METHOD1(onChunkComplete, void(HTTPCodec::StreamID));
   MOCK_METHOD2(onTrailersComplete,
@@ -200,7 +200,8 @@ class MockHTTPCodecCallback : public HTTPCodec::Callback {
   MOCK_METHOD1(onSettings, void(const SettingsList&));
   MOCK_METHOD0(onSettingsAck, void());
   MOCK_METHOD2(onPriority,
-               void(HTTPCodec::StreamID, const HTTPMessage::HTTPPriority&));
+               void(HTTPCodec::StreamID, const HTTPMessage::HTTP2Priority&));
+  MOCK_METHOD2(onPriority, void(HTTPCodec::StreamID, const HTTPPriority&));
   MOCK_METHOD2(onCertificateRequest,
                void(uint16_t, std::shared_ptr<folly::IOBuf>));
   void onCertificateRequest(

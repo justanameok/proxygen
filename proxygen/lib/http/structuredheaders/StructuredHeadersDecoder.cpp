@@ -125,15 +125,12 @@ DecodeError StructuredHeadersDecoder::decodeMap(
       return buf_.handleDecodeError(DecodeError::DUPLICATE_KEY);
     }
 
-    err = buf_.removeSymbol("=", mapType == MapType::DICTIONARY);
+    err = buf_.removeSymbol("=", false /* strict */);
     if (err != DecodeError::OK) {
-      if (mapType == MapType::DICTIONARY) {
-        return err;
-      } else {
-        StructuredHeaderItem value;
-        value.tag = StructuredHeaderItem::Type::NONE;
-        result[thisKey] = value;
-      }
+      StructuredHeaderItem value;
+      value.tag = StructuredHeaderItem::Type::BOOLEAN;
+      value.value = true;
+      result[thisKey] = value;
     } else {
       StructuredHeaderItem value;
       err = buf_.parseItem(value);
@@ -144,11 +141,11 @@ DecodeError StructuredHeadersDecoder::decodeMap(
       result[thisKey] = value;
     }
 
-    buf_.removeOptionalWhitespace();
-
     if (buf_.isEmpty()) {
       return DecodeError::OK;
     }
+
+    buf_.removeOptionalWhitespace();
 
     err = buf_.removeSymbol(delimiter, mapType == MapType::DICTIONARY);
     if (err != DecodeError::OK) {

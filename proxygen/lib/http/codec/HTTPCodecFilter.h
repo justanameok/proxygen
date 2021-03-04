@@ -52,8 +52,6 @@ class PassThroughHTTPCodecFilter : public HTTPCodecFilter {
               std::unique_ptr<folly::IOBuf> chain,
               uint16_t padding) override;
 
-  void onUnframedBodyStarted(StreamID stream, uint64_t streamOffset) override;
-
   void onChunkHeader(StreamID stream, size_t length) override;
 
   void onChunkComplete(StreamID stream) override;
@@ -90,7 +88,11 @@ class PassThroughHTTPCodecFilter : public HTTPCodecFilter {
   void onSettingsAck() override;
 
   void onPriority(StreamID stream,
-                  const HTTPMessage::HTTPPriority& pri) override;
+                  const HTTPMessage::HTTP2Priority& pri) override;
+
+  void onPriority(StreamID stream, const HTTPPriority& pri) override;
+
+  void onPushPriority(StreamID stream, const HTTPPriority& pri) override;
 
   bool onNativeProtocolUpgrade(StreamID stream,
                                CodecProtocol protocol,
@@ -155,7 +157,8 @@ class PassThroughHTTPCodecFilter : public HTTPCodecFilter {
                       StreamID stream,
                       const HTTPMessage& msg,
                       bool eom,
-                      HTTPHeaderSize* size) override;
+                      HTTPHeaderSize* size,
+                      folly::Optional<HTTPHeaders> extraHeaders) override;
 
   void generatePushPromise(folly::IOBufQueue& writeBuf,
                            StreamID stream,
@@ -216,7 +219,15 @@ class PassThroughHTTPCodecFilter : public HTTPCodecFilter {
 
   size_t generatePriority(folly::IOBufQueue& writeBuf,
                           StreamID stream,
-                          const HTTPMessage::HTTPPriority& pri) override;
+                          const HTTPMessage::HTTP2Priority& pri) override;
+
+  size_t generatePriority(folly::IOBufQueue& writeBuf,
+                          StreamID streamId,
+                          HTTPPriority priority) override;
+
+  size_t generatePushPriority(folly::IOBufQueue& writeBuf,
+                              StreamID pushId,
+                              HTTPPriority priority) override;
 
   size_t generateCertificateRequest(
       folly::IOBufQueue& writeBuf,

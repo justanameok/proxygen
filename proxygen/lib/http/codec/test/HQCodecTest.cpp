@@ -131,9 +131,7 @@ class HQCodecTestFixture : public T {
         qpackUpEncoderWriteBuf_,
         qpackUpDecoderWriteBuf_,
         [] { return std::numeric_limits<uint64_t>::max(); },
-        egressSettings_,
-        ingressSettings_,
-        isTransportPartiallyReliable);
+        ingressSettings_);
     downstreamCodec_ = std::make_unique<HQStreamCodec>(
         streamId_,
         TransportDirection::DOWNSTREAM,
@@ -141,10 +139,10 @@ class HQCodecTestFixture : public T {
         qpackDownEncoderWriteBuf_,
         qpackDownDecoderWriteBuf_,
         [] { return std::numeric_limits<uint64_t>::max(); },
-        egressSettings_,
-        ingressSettings_,
-        isTransportPartiallyReliable);
+        ingressSettings_);
   }
+
+  void testGoaway(HQControlCodec& codec, uint64_t drainId);
 
  protected:
   FakeHQHTTPCodecCallback callbacks_;
@@ -158,7 +156,7 @@ class HQCodecTestFixture : public T {
   HQControlCodec downstreamControlCodec_{0x2222,
                                          TransportDirection::DOWNSTREAM,
                                          StreamDirection::INGRESS,
-                                         egressSettings_,
+                                         ingressSettings_,
                                          hq::UnidirectionalStreamType::CONTROL};
   HQControlCodec upstreamH1qControlCodec_{
       0x1111,
@@ -189,13 +187,6 @@ class HQCodecTestFixture : public T {
 
 class HQCodecTest : public HQCodecTestFixture<Test> {};
 
-class HQPRCodecTest : public HQCodecTest {
-  void SetUp() override {
-    makeCodecs(true);
-    SetUpCodecs();
-  }
-};
-
 TEST_F(HQCodecTest, DataFrame) {
   auto data = makeBuf(500);
   writeFrameHeaderManual(
@@ -207,471 +198,15 @@ TEST_F(HQCodecTest, DataFrame) {
   EXPECT_EQ(callbacks_.bodyLength, data->length());
 }
 
-TEST_F(HQPRCodecTest, DataFrameZeroLength) {
-  const auto& ingressPrBodyTracker =
-      downstreamCodec_->getIngressPrBodyTracker();
-
-  auto data = makeBuf(500);
-  size_t n =
-      writeFrameHeaderManual(queue_, static_cast<uint8_t>(FrameType::DATA), 0);
-  queue_.append(data->clone());
-  parse();
-
-  EXPECT_EQ(callbacks_.headerFrames, 1);
-  EXPECT_EQ(callbacks_.bodyCalls, 1);
-  EXPECT_EQ(callbacks_.bodyLength, data->length());
-
-  auto bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, n);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(), 500);
-
-  // Write again.
-  queue_.append(data->clone());
-  parse();
-  EXPECT_EQ(callbacks_.headerFrames, 1);
-  EXPECT_EQ(callbacks_.bodyCalls, 2);
-  EXPECT_EQ(callbacks_.bodyLength, data->length() * 2);
-
-  bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, n);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(), 1000);
-}
-
-TEST_F(HQPRCodecTest, DataFrameZeroLengthWithHeaders) {
-  const auto& ingressPrBodyTracker =
-      downstreamCodec_->getIngressPrBodyTracker();
-  size_t n = addAndCheckSimpleHeaders();
-
-  auto data = makeBuf(500);
-  n += writeFrameHeaderManual(queue_, static_cast<uint8_t>(FrameType::DATA), 0);
-  queue_.append(data->clone());
-  parse();
-  EXPECT_EQ(callbacks_.headerFrames, 2);
-  EXPECT_EQ(callbacks_.bodyCalls, 1);
-  EXPECT_EQ(callbacks_.bodyLength, data->length());
-
-  auto bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, n);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(), 500);
-
-  // Write again.
-  queue_.append(data->clone());
-  parse();
-  EXPECT_EQ(callbacks_.headerFrames, 2);
-  EXPECT_EQ(callbacks_.bodyCalls, 2);
-  EXPECT_EQ(callbacks_.bodyLength, data->length() * 2);
-
-  bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, n);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(), 1000);
-}
-
-TEST_F(HQPRCodecTest, TestOnIngressBodyPeek) {
-  const auto& ingressPrBodyTracker =
-      downstreamCodec_->getIngressPrBodyTracker();
-
-  size_t n = addAndCheckSimpleHeaders();
-
-  auto res = downstreamCodec_->onIngressDataAvailable(42);
-  EXPECT_TRUE(res.hasError());
-  EXPECT_EQ(res.error(), UnframedBodyOffsetTrackerError::NO_ERROR);
-
-  auto data = makeBuf(500);
-  n += writeFrameHeaderManual(queue_, static_cast<uint8_t>(FrameType::DATA), 0);
-  queue_.append(data->clone());
-  parse();
-  EXPECT_EQ(callbacks_.headerFrames, 2);
-  EXPECT_EQ(callbacks_.bodyCalls, 1);
-  EXPECT_EQ(callbacks_.bodyLength, data->length());
-
-  auto bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, n);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(), 500);
-
-  res = downstreamCodec_->onIngressDataAvailable(42);
-  EXPECT_FALSE(res.hasError());
-  EXPECT_EQ(*res, 42 - n);
-
-  bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, n);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(), 500);
-}
-
-TEST_F(HQPRCodecTest, TestOnIngressBodyPeekBadOffset) {
-  const auto& ingressPrBodyTracker =
-      downstreamCodec_->getIngressPrBodyTracker();
-  size_t n = addAndCheckSimpleHeaders();
-
-  auto data = makeBuf(500);
-  n += writeFrameHeaderManual(queue_, static_cast<uint8_t>(FrameType::DATA), 0);
-  queue_.append(data->clone());
-  parse();
-  EXPECT_EQ(callbacks_.headerFrames, 2);
-  EXPECT_EQ(callbacks_.bodyCalls, 1);
-  EXPECT_EQ(callbacks_.bodyLength, data->length());
-
-  auto bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, n);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(), 500);
-
-  // 1 is before body stream offset, so shouldn't trigger the callback.
-  auto res = downstreamCodec_->onIngressDataAvailable(1);
-  EXPECT_TRUE(res.hasError());
-
-  bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, n);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(), 500);
-}
-
-/*
-TEST_F(HQPRCodecTest, TestOnIngressBodyExpiredBeforeHeaders) {
-  const auto& ingressPrBodyTracker = upstreamCodec_->getIngressPrBodyTracker();
-  auto res = upstreamCodec_->onIngressDataExpired(42);
-  EXPECT_TRUE(res.hasError());
-  EXPECT_EQ(res.error(), UnframedBodyOffsetTrackerError::NO_ERROR);
-  EXPECT_FALSE(ingressPrBodyTracker.bodyStarted());
-}
-
-TEST_F(HQPRCodecTest, TestOnIngressBodyExpiredBadstreamOffset) {
-  const auto& ingressPrBodyTracker = upstreamCodec_->getIngressPrBodyTracker();
-  HTTPMessage resp = getResponse(200, 500);
-  auto streamId = upstreamCodec_->createStream();
-  downstreamCodec_->generateHeader(queue_, streamId, resp, false, nullptr);
-  parseUpstream();
-  EXPECT_FALSE(ingressPrBodyTracker.bodyStarted());
-
-  // 1 is before body stream offset, so shouldn't trigger the callback.
-  auto res = upstreamCodec_->onIngressDataExpired(1);
-  EXPECT_TRUE(res.hasError());
-  EXPECT_EQ(res.error(), UnframedBodyOffsetTrackerError::INVALID_OFFSET);
-  EXPECT_FALSE(ingressPrBodyTracker.bodyStarted());
-}
-*/
-
-TEST_F(HQPRCodecTest, TestSplitPrEnabled) {
-  const auto& ingressPrBodyTracker = upstreamCodec_->getIngressPrBodyTracker();
-  HTTPMessage resp = getResponse(200, 500);
-  resp.setPartiallyReliable();
-  auto streamId = upstreamCodec_->createStream();
-  uint64_t bodyStreamOffset = queue_.chainLength();
-  downstreamCodec_->generateHeader(queue_, streamId, resp, false, nullptr);
-  bodyStreamOffset = queue_.chainLength() - bodyStreamOffset;
-  parseUpstream();
-  EXPECT_TRUE(ingressPrBodyTracker.bodyStarted());
-
-  // For upstream, only ingress should be PR-enabled.
-  EXPECT_TRUE(upstreamCodec_->isIngressPartiallyRealible());
-  EXPECT_FALSE(upstreamCodec_->isEgressPartiallyRealible());
-  // The other way around for downstream.
-  EXPECT_FALSE(downstreamCodec_->isIngressPartiallyRealible());
-  EXPECT_TRUE(downstreamCodec_->isEgressPartiallyRealible());
-}
-
-TEST_F(HQPRCodecTest, TestOnIngressBodyExpiredStartWithSkip) {
-  const auto& ingressPrBodyTracker = upstreamCodec_->getIngressPrBodyTracker();
-  HTTPMessage resp = getResponse(200, 500);
-  resp.setPartiallyReliable();
-  auto streamId = upstreamCodec_->createStream();
-  uint64_t bodyStreamOffset = queue_.chainLength();
-  downstreamCodec_->generateHeader(queue_, streamId, resp, false, nullptr);
-  bodyStreamOffset = queue_.chainLength() - bodyStreamOffset;
-  parseUpstream();
-  EXPECT_TRUE(ingressPrBodyTracker.bodyStarted());
-
-  uint64_t testStreamOffset = 73;
-  uint64_t expectedBodyAppOffset = testStreamOffset - bodyStreamOffset;
-
-  auto res = upstreamCodec_->onIngressDataExpired(testStreamOffset);
-  EXPECT_FALSE(res.hasError());
-  EXPECT_EQ(*res, expectedBodyAppOffset);
-
-  auto bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, bodyStreamOffset);
-
-  auto data = makeBuf(500);
-  uint64_t totalBodyBytesProcessed = expectedBodyAppOffset + 500;
-  queue_.append(data->clone());
-  parseUpstream();
-  EXPECT_EQ(callbacks_.headerFrames, 2);
-  EXPECT_EQ(callbacks_.bodyCalls, 1);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(),
-            totalBodyBytesProcessed);
-
-  testStreamOffset = 673;
-  expectedBodyAppOffset = testStreamOffset - bodyStreamOffset;
-
-  res = upstreamCodec_->onIngressDataExpired(testStreamOffset);
-  EXPECT_FALSE(res.hasError());
-  EXPECT_EQ(*res, expectedBodyAppOffset);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(),
-            expectedBodyAppOffset);
-}
-
-TEST_F(HQPRCodecTest, TestOnIngressBodyExpiredStartWithBody) {
-  const auto& ingressPrBodyTracker = upstreamCodec_->getIngressPrBodyTracker();
-  HTTPMessage resp = getResponse(200, 500);
-  auto streamId = upstreamCodec_->createStream();
-  uint64_t bodyStreamOffset = queue_.chainLength();
-  downstreamCodec_->generateHeader(queue_, streamId, resp, false, nullptr);
-  writeFrameHeaderManual(queue_, static_cast<uint64_t>(FrameType::DATA), 0);
-  bodyStreamOffset = queue_.chainLength() - bodyStreamOffset;
-  parseUpstream();
-  EXPECT_TRUE(ingressPrBodyTracker.bodyStarted());
-
-  auto data = makeBuf(500);
-  uint64_t expectedBodyBytesProcessed = 500;
-  queue_.append(data->clone());
-  parseUpstream();
-
-  EXPECT_EQ(callbacks_.headerFrames, 2);
-  EXPECT_EQ(callbacks_.bodyCalls, 1);
-  EXPECT_EQ(callbacks_.bodyLength, expectedBodyBytesProcessed);
-  auto bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, bodyStreamOffset);
-
-  uint64_t testStreamOffset = 927;
-  uint64_t expectedBodyAppOffset = testStreamOffset - bodyStreamOffset;
-  auto res = upstreamCodec_->onIngressDataExpired(testStreamOffset);
-  EXPECT_FALSE(res.hasError());
-  EXPECT_EQ(*res, expectedBodyAppOffset);
-
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(),
-            expectedBodyAppOffset);
-}
-
-TEST_F(HQPRCodecTest, TestOnIngressBodyRejectedBeforeHeaders) {
-  const auto& egressPrBodyTracker = downstreamCodec_->getEgressPrBodyTracker();
-  auto res = downstreamCodec_->onIngressDataRejected(42);
-  EXPECT_TRUE(res.hasError());
-  EXPECT_FALSE(egressPrBodyTracker.bodyStarted());
-}
-
-TEST_F(HQPRCodecTest, TestOnIngressBodyRejectedBadstreamOffset) {
-  const auto& egressPrBodyTracker = downstreamCodec_->getEgressPrBodyTracker();
-  addAndCheckSimpleHeaders();
-  EXPECT_FALSE(egressPrBodyTracker.bodyStarted());
-
-  // 1 is before body stream offset, so shouldn't trigger the callback.
-  auto res = downstreamCodec_->onIngressDataRejected(1);
-  EXPECT_TRUE(res.hasError());
-  EXPECT_FALSE(egressPrBodyTracker.bodyStarted());
-}
-
-TEST_F(HQPRCodecTest, TestOnIngressBodyRejectedStartWithSkip) {
-  const auto& egressPrBodyTracker = downstreamCodec_->getEgressPrBodyTracker();
-  HTTPMessage resp = getResponse(200, 500);
-  resp.setPartiallyReliable();
-  auto streamId = downstreamCodec_->createStream();
-  uint64_t bodyStreamOffset = queue_.chainLength();
-  downstreamCodec_->generateHeader(queue_, streamId, resp, false, nullptr);
-  bodyStreamOffset = queue_.chainLength() - bodyStreamOffset;
-  queue_.move();
-  EXPECT_TRUE(egressPrBodyTracker.bodyStarted());
-
-  uint64_t testStreamOffset = 73;
-  uint64_t expectedBodyAppOffset = testStreamOffset - bodyStreamOffset;
-
-  auto res = downstreamCodec_->onIngressDataRejected(testStreamOffset);
-  EXPECT_FALSE(res.hasError());
-  EXPECT_EQ(*res, expectedBodyAppOffset);
-
-  auto bodyStreamOffsetStart = egressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, bodyStreamOffset);
-
-  auto data = makeBuf(500);
-  downstreamCodec_->generateBody(
-      queue_, streamId, std::move(data), folly::none, false);
-  queue_.move();
-
-  testStreamOffset = 873;
-  expectedBodyAppOffset = testStreamOffset - bodyStreamOffset;
-  res = downstreamCodec_->onIngressDataRejected(testStreamOffset);
-  EXPECT_FALSE(res.hasError());
-  EXPECT_EQ(*res, expectedBodyAppOffset);
-  EXPECT_EQ(egressPrBodyTracker.getBodyBytesProcessed(), expectedBodyAppOffset);
-}
-
-TEST_F(HQPRCodecTest, TestOnIngressBodyRejectedStartWithBody) {
-  const auto& egressPrBodyTracker = downstreamCodec_->getEgressPrBodyTracker();
-  HTTPMessage resp = getResponse(200, 500);
-  resp.setPartiallyReliable();
-  auto streamId = downstreamCodec_->createStream();
-  uint64_t bodyStreamOffset = queue_.chainLength();
-  downstreamCodec_->generateHeader(queue_, streamId, resp, false, nullptr);
-  bodyStreamOffset = queue_.chainLength() - bodyStreamOffset;
-  queue_.move();
-  EXPECT_TRUE(egressPrBodyTracker.bodyStarted());
-
-  auto data = makeBuf(500);
-  uint64_t expectedBodyBytesProcessed = 500;
-  downstreamCodec_->generateBody(
-      queue_, streamId, std::move(data), folly::none, false);
-  queue_.move();
-
-  auto bodyStreamOffsetStart = egressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, bodyStreamOffset);
-  EXPECT_EQ(egressPrBodyTracker.getBodyBytesProcessed(),
-            expectedBodyBytesProcessed);
-
-  uint64_t testStreamOffset = 836;
-  uint64_t expectedBodyAppOffset = testStreamOffset - bodyStreamOffset;
-  auto res = downstreamCodec_->onIngressDataRejected(testStreamOffset);
-  EXPECT_FALSE(res.hasError());
-  EXPECT_EQ(*res, expectedBodyAppOffset);
-  EXPECT_EQ(egressPrBodyTracker.getBodyBytesProcessed(), expectedBodyAppOffset);
-}
-
-TEST_F(HQPRCodecTest, TestOnEgressBodyExpiredBeforeHeaders) {
-  auto res = downstreamCodec_->onEgressBodySkip(13);
-  EXPECT_TRUE(res.hasError());
-  EXPECT_EQ(res.error(), hq::UnframedBodyOffsetTrackerError::INVALID_OFFSET);
-}
-
-TEST_F(HQPRCodecTest, TestOnEgressBodyExpiredStartWithSkip) {
-  const auto& egressPrBodyTracker = downstreamCodec_->getEgressPrBodyTracker();
-  HTTPMessage resp = getResponse(200, 500);
-  resp.setPartiallyReliable();
-  auto streamId = downstreamCodec_->createStream();
-  uint64_t bodyStreamOffset = queue_.chainLength();
-  downstreamCodec_->generateHeader(queue_, streamId, resp, false, nullptr);
-  bodyStreamOffset = queue_.chainLength() - bodyStreamOffset;
-  queue_.move();
-  EXPECT_TRUE(egressPrBodyTracker.bodyStarted());
-
-  uint64_t testAppOffset = 73;
-
-  auto expectedstreamOffset = downstreamCodec_->onEgressBodySkip(testAppOffset);
-  auto bodyStreamOffsetStart = egressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, bodyStreamOffset);
-  EXPECT_FALSE(expectedstreamOffset.hasError());
-  EXPECT_EQ(*expectedstreamOffset, bodyStreamOffset + testAppOffset);
-
-  auto data = makeBuf(500);
-  downstreamCodec_->generateBody(
-      queue_, streamId, std::move(data), folly::none, false);
-  queue_.move();
-  EXPECT_EQ(egressPrBodyTracker.getBodyBytesProcessed(), 500 + 73);
-
-  testAppOffset = 817;
-  expectedstreamOffset = downstreamCodec_->onEgressBodySkip(testAppOffset);
-  EXPECT_FALSE(expectedstreamOffset.hasError());
-  EXPECT_EQ(*expectedstreamOffset, bodyStreamOffset + testAppOffset);
-}
-
-TEST_F(HQPRCodecTest, TestOnEgressBodyExpiredStartWithBody) {
-  const auto& egressPrBodyTracker = downstreamCodec_->getEgressPrBodyTracker();
-  HTTPMessage resp = getResponse(200, 500);
-  resp.setPartiallyReliable();
-  auto streamId = downstreamCodec_->createStream();
-  uint64_t bodyStreamOffset = queue_.chainLength();
-  downstreamCodec_->generateHeader(queue_, streamId, resp, false, nullptr);
-  bodyStreamOffset = queue_.chainLength() - bodyStreamOffset;
-  queue_.move();
-  EXPECT_TRUE(egressPrBodyTracker.bodyStarted());
-
-  auto data = makeBuf(500);
-  downstreamCodec_->generateBody(
-      queue_, streamId, std::move(data), folly::none, false);
-  queue_.move();
-  auto bodyStreamOffsetStart = egressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, bodyStreamOffset);
-  EXPECT_EQ(egressPrBodyTracker.getBodyBytesProcessed(), 500);
-
-  uint64_t testAppOffset = 817;
-  auto expectedstreamOffset = downstreamCodec_->onEgressBodySkip(testAppOffset);
-  EXPECT_FALSE(expectedstreamOffset.hasError());
-  EXPECT_EQ(*expectedstreamOffset, bodyStreamOffset + testAppOffset);
-}
-
-TEST_F(HQPRCodecTest, TestOnEgressBodyRejectedBeforeHeaders) {
-  const auto& ingressPrBodyTracker = upstreamCodec_->getIngressPrBodyTracker();
-  auto res = upstreamCodec_->onEgressBodyReject(42);
-  EXPECT_TRUE(res.hasError());
-  EXPECT_EQ(res.error(), UnframedBodyOffsetTrackerError::INVALID_OFFSET);
-  EXPECT_FALSE(ingressPrBodyTracker.bodyStarted());
-}
-
-TEST_F(HQPRCodecTest, TestOnEgressBodyRejectedStartWithSkip) {
-  const auto& ingressPrBodyTracker = upstreamCodec_->getIngressPrBodyTracker();
-  HTTPMessage resp = getResponse(200, 500);
-  resp.setPartiallyReliable();
-  auto streamId = downstreamCodec_->createStream();
-  uint64_t bodyStreamOffset = queue_.chainLength();
-  downstreamCodec_->generateHeader(queue_, streamId, resp, false, nullptr);
-  bodyStreamOffset = queue_.chainLength() - bodyStreamOffset;
-  parseUpstream();
-  EXPECT_EQ(callbacks_.streamErrors, 0);
-  EXPECT_EQ(callbacks_.headerFrames, 2);
-  EXPECT_EQ(callbacks_.bodyCalls, 0);
-  EXPECT_TRUE(ingressPrBodyTracker.bodyStarted());
-
-  uint64_t testAppOffset = 73;
-  auto streamOffset = upstreamCodec_->onEgressBodyReject(testAppOffset);
-  EXPECT_FALSE(streamOffset.hasError());
-  EXPECT_EQ(*streamOffset, testAppOffset + bodyStreamOffset);
-
-  auto data = makeBuf(500);
-  queue_.append(data->clone());
-  parseUpstream();
-  EXPECT_EQ(callbacks_.streamErrors, 0);
-  EXPECT_EQ(callbacks_.headerFrames, 2);
-  EXPECT_EQ(callbacks_.bodyCalls, 1);
-  auto bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, bodyStreamOffset);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(), testAppOffset + 500);
-
-  testAppOffset = 673;
-  streamOffset = upstreamCodec_->onEgressBodyReject(testAppOffset);
-  EXPECT_FALSE(streamOffset.hasError());
-  EXPECT_EQ(*streamOffset, testAppOffset + bodyStreamOffset);
-}
-
-TEST_F(HQPRCodecTest, TestOnEgressBodyRejectedStartWithBody) {
-  const auto& ingressPrBodyTracker = upstreamCodec_->getIngressPrBodyTracker();
-  HTTPMessage resp = getResponse(200, 500);
-  auto streamId = upstreamCodec_->createStream();
-  uint64_t bodyStreamOffset = queue_.chainLength();
-  downstreamCodec_->generateHeader(queue_, streamId, resp, false, nullptr);
-  bodyStreamOffset = queue_.chainLength() - bodyStreamOffset;
-  parseUpstream();
-  EXPECT_EQ(callbacks_.streamErrors, 0);
-  EXPECT_EQ(callbacks_.headerFrames, 1);
-  EXPECT_EQ(callbacks_.bodyCalls, 0);
-  EXPECT_FALSE(ingressPrBodyTracker.bodyStarted());
-
-  auto data = makeBuf(500);
-  bodyStreamOffset +=
-      writeFrameHeaderManual(queue_, static_cast<uint8_t>(FrameType::DATA), 0);
-  queue_.append(data->clone());
-  parseUpstream();
-  EXPECT_EQ(callbacks_.streamErrors, 0);
-  EXPECT_EQ(callbacks_.headerFrames, 2);
-  EXPECT_EQ(callbacks_.bodyCalls, 1);
-  EXPECT_EQ(callbacks_.bodyLength, data->length());
-  auto bodyStreamOffsetStart = ingressPrBodyTracker.getBodyStreamStartOffset();
-  EXPECT_FALSE(bodyStreamOffsetStart.hasError());
-  EXPECT_EQ(*bodyStreamOffsetStart, bodyStreamOffset);
-  EXPECT_EQ(ingressPrBodyTracker.getBodyBytesProcessed(), 500);
-
-  uint64_t testAppOffset = 775;
-  auto streamOffset = upstreamCodec_->onEgressBodyReject(testAppOffset);
-  EXPECT_FALSE(streamOffset.hasError());
-  EXPECT_EQ(*streamOffset, testAppOffset + bodyStreamOffset);
+TEST_F(HQCodecTest, PriorityUpdate) {
+  // SETTINGS is a must have
+  writeValidFrame(queueCtrl_, FrameType::SETTINGS);
+  EXPECT_GT(upstreamControlCodec_.generatePriority(
+                queueCtrl_, 123, HTTPPriority(5, true)),
+            0);
+  parseControl(CodecType::CONTROL_DOWNSTREAM);
+  EXPECT_EQ(5, callbacks_.urgency);
+  EXPECT_TRUE(callbacks_.incremental);
 }
 
 TEST_F(HQCodecTest, DataFrameStreaming) {
@@ -699,7 +234,7 @@ TEST_F(HQCodecTest, DataFrameStreaming) {
 }
 
 TEST_F(HQCodecTest, PushPromiseFrame) {
-  hq::PushId pushId = 1234 | kPushIdMask;
+  hq::PushId pushId = 1234;
 
   HTTPMessage msg = getGetRequest();
   msg.getHeaders().add(HTTP_HEADER_USER_AGENT, "optimus-prime");
@@ -715,6 +250,104 @@ TEST_F(HQCodecTest, PushPromiseFrame) {
   EXPECT_EQ(callbacks_.messageBegin, 1);
   EXPECT_EQ(callbacks_.pushId, pushId);
   EXPECT_EQ(callbacks_.assocStreamId, streamId_);
+}
+
+TEST_F(HQCodecTest, HeadersOverSize) {
+  // Server sends limited MAX_HEADER_LIST_SIZE, client will send anyways,
+  // server errors
+  HTTPSettings egressSettings{{SettingsId::MAX_HEADER_LIST_SIZE, 37}};
+  HQControlCodec downstreamControlEgressCodec{
+      0x2223,
+      TransportDirection::DOWNSTREAM,
+      StreamDirection::EGRESS,
+      egressSettings,
+      hq::UnidirectionalStreamType::CONTROL};
+  downstreamControlEgressCodec.generateSettings(queueCtrl_);
+  parseControl(CodecType::CONTROL_UPSTREAM);
+  // set so the stream codec sees it
+  // TODO: the downstream codec doesn't have access to the egress settings,
+  // it relies on QPACK to check this
+  qpackDownstream_.setMaxUncompressed(37);
+
+  HTTPMessage msg = getGetRequest();
+  msg.getHeaders().add(HTTP_HEADER_USER_AGENT, "optimus-prime");
+  upstreamCodec_->generateHeader(queue_, streamId_, msg, false, nullptr);
+
+  HTTPHeaders trailers;
+  trailers.add("x-trailer-1", "pico-de-gallo");
+  // These trailers are generated, but never parsed because it pauses after
+  // the headers error
+  upstreamCodec_->generateTrailers(queue_, streamId_, trailers);
+  parse();
+  downstreamCodec_->onIngressEOF();
+
+  EXPECT_EQ(callbacks_.messageBegin, 1);
+  EXPECT_EQ(callbacks_.headersComplete, 0);
+  EXPECT_EQ(callbacks_.messageComplete, 0);
+  EXPECT_EQ(callbacks_.streamErrors, 0);
+  EXPECT_EQ(callbacks_.sessionErrors, 1);
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_QPACK_DECOMPRESSION_FAILED);
+}
+
+TEST_F(HQCodecTest, Trailers) {
+  for (auto body = 0; body <= 1; body++) {
+    HTTPMessage msg = getPostRequest(body * 5);
+    msg.getHeaders().add(HTTP_HEADER_USER_AGENT, "optimus-prime");
+    upstreamCodec_->generateHeader(queue_, streamId_, msg, false, nullptr);
+
+    if (body) {
+      std::string data("abcde");
+      auto buf = folly::IOBuf::copyBuffer(data.data(), data.length());
+      upstreamCodec_->generateBody(queue_,
+                                   streamId_,
+                                   std::move(buf),
+                                   HTTPCodec::NoPadding,
+                                   /*eom=*/false);
+    }
+    HTTPHeaders trailers;
+    trailers.add("x-trailer-1", "pico-de-gallo");
+    // stripped on generate
+    trailers.add(HTTP_HEADER_CONNECTION, "keep-alive");
+    upstreamCodec_->generateTrailers(queue_, streamId_, trailers);
+    upstreamCodec_->generateEOM(queue_, streamId_);
+    parse();
+    downstreamCodec_->onIngressEOF();
+
+    EXPECT_EQ(callbacks_.messageBegin, 1);
+    EXPECT_EQ(callbacks_.headersComplete, 1);
+    EXPECT_EQ(callbacks_.bodyCalls, body);
+    EXPECT_EQ(callbacks_.bodyLength, body * 5);
+    EXPECT_EQ(callbacks_.trailers, 1);
+    EXPECT_NE(nullptr, callbacks_.msg->getTrailers());
+    EXPECT_EQ("pico-de-gallo",
+              callbacks_.msg->getTrailers()->getSingleOrEmpty("x-trailer-1"));
+    EXPECT_EQ(callbacks_.msg->getTrailers()->size(), 1);
+    EXPECT_EQ(callbacks_.messageComplete, 1);
+    EXPECT_EQ(callbacks_.streamErrors, 0);
+    EXPECT_EQ(callbacks_.sessionErrors, 0);
+    callbacks_.reset();
+    makeCodecs(false);
+    downstreamCodec_->setCallback(&callbacks_);
+  }
+}
+
+TEST_F(HQCodecTest, GenerateExtraHeaders) {
+  HTTPMessage resp = getResponse(200, 2000);
+  HTTPHeaders extraHeaders;
+  extraHeaders.add(HTTP_HEADER_PRIORITY, "u=2");
+  downstreamCodec_->generateHeader(queue_,
+                                   streamId_,
+                                   resp,
+                                   true /* eom */,
+                                   nullptr /* HTTPHeaderSize */,
+                                   std::move(extraHeaders));
+
+  parseUpstream();
+
+  const auto& headers = callbacks_.msg->getHeaders();
+  EXPECT_EQ("2000", headers.getSingleOrEmpty(HTTP_HEADER_CONTENT_LENGTH));
+  EXPECT_EQ("u=2", headers.getSingleOrEmpty(HTTP_HEADER_PRIORITY));
 }
 
 template <class T>
@@ -781,16 +414,16 @@ TEST_F(HQCodecTest, qpackBlocked) {
 
 TEST_F(HQCodecTest, qpackError) {
   qpackEncoderCodec_.onUnidirectionalIngress(folly::IOBuf::wrapBuffer("", 1));
-  EXPECT_EQ(callbacks_.lastParseError->getErrno(),
-            uint32_t(HTTP3::ErrorCode::HTTP_QPACK_ENCODER_STREAM_ERROR));
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_QPACK_ENCODER_STREAM_ERROR);
   EXPECT_EQ(callbacks_.sessionErrors, 1);
   qpackDecoderCodec_.onUnidirectionalIngressEOF();
-  EXPECT_EQ(callbacks_.lastParseError->getErrno(),
-            uint32_t(HTTP3::ErrorCode::HTTP_CLOSED_CRITICAL_STREAM));
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_CLOSED_CRITICAL_STREAM);
   EXPECT_EQ(callbacks_.sessionErrors, 2);
   qpackEncoderCodec_.onUnidirectionalIngressEOF();
-  EXPECT_EQ(callbacks_.lastParseError->getErrno(),
-            uint32_t(HTTP3::ErrorCode::HTTP_CLOSED_CRITICAL_STREAM));
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_CLOSED_CRITICAL_STREAM);
   EXPECT_EQ(callbacks_.sessionErrors, 3);
 
   // duplicate method in headers
@@ -804,14 +437,15 @@ TEST_F(HQCodecTest, qpackError) {
   downstreamCodec_->onIngress(*queue_.front());
   EXPECT_EQ(callbacks_.lastParseError->getHttpStatusCode(), 400);
   EXPECT_EQ(callbacks_.streamErrors, 1);
-  queue_.move();
+}
 
+TEST_F(HQCodecTest, qpackErrorShort) {
   uint8_t bad[] = {0x00}; // LR, no delta base
   hq::writeHeaders(queue_, folly::IOBuf::wrapBuffer(bad, 1));
   downstreamCodec_->onIngress(*queue_.front());
-  EXPECT_EQ(callbacks_.lastParseError->getErrno(),
-            uint32_t(HTTP3::ErrorCode::HTTP_QPACK_DECOMPRESSION_FAILED));
-  EXPECT_EQ(callbacks_.sessionErrors, 4);
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_QPACK_DECOMPRESSION_FAILED);
+  EXPECT_EQ(callbacks_.sessionErrors, 1);
 }
 
 TEST_F(HQCodecTest, extraHeaders) {
@@ -824,27 +458,152 @@ TEST_F(HQCodecTest, extraHeaders) {
   EXPECT_EQ(callbacks_.streamErrors, 0);
   downstreamCodec_->onIngress(*queue_.front());
   EXPECT_EQ(callbacks_.streamErrors, 1);
+  // The headers fail to parse because the codec thinks they are trailers
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_MESSAGE_ERROR);
   queue_.move();
+  callbacks_.reset();
   writeFrameHeaderManual(
       queue_, static_cast<uint64_t>(FrameType::HEADERS), simpleResp.size());
   queue_.append(simpleResp.data(), simpleResp.size());
   upstreamCodec_->onIngress(*queue_.front());
-  EXPECT_EQ(callbacks_.streamErrors, 1);
+  EXPECT_EQ(callbacks_.streamErrors, 0);
   upstreamCodec_->onIngress(*queue_.front());
-  EXPECT_EQ(callbacks_.streamErrors, 2);
+  EXPECT_EQ(callbacks_.streamErrors, 1);
+  // The headers fail to parse because the codec thinks they are trailers
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_MESSAGE_ERROR);
 }
 
-/* test that parsing multiple frame headers stops the parser */
+/* A second HEADERS frame is unexpected, and stops the parser */
 TEST_F(HQCodecTest, MultipleHeaders) {
   writeValidFrame(queue_, FrameType::HEADERS);
 
-  writeFrameHeaderManual(
-      queue_, static_cast<uint64_t>(FrameType::HEADERS), 0x08);
+  // Write empty trailers, no more HEADERS frames allowed
+  std::array<uint8_t, 2> emptyHeaderBlock{0x00, 0x00};
+  hq::writeHeaders(queue_,
+                   folly::IOBuf::copyBuffer(emptyHeaderBlock.data(),
+                                            emptyHeaderBlock.size()));
 
-  std::array<uint8_t, 10> data{
-      0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-  queue_.append(data.data(), data.size());
+  // Write invalid QPACK header.  It is never parsed because the frame is
+  // unexpected
+  std::array<uint8_t, 2> qpackError{0xC0, 0x00};
+  hq::writeHeaders(
+      queue_, folly::IOBuf::copyBuffer(qpackError.data(), qpackError.size()));
   parse();
+  // never seen, parser is paused
+  downstreamCodec_->onIngressEOF();
+  EXPECT_EQ(callbacks_.messageBegin, 1);
+  EXPECT_EQ(callbacks_.headersComplete, 1);
+  EXPECT_EQ(callbacks_.messageComplete, 0);
+  EXPECT_EQ(callbacks_.streamErrors, 1);
+  EXPECT_EQ(callbacks_.sessionErrors, 0);
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED);
+}
+
+/* An invalid HEADERS frame stops the parser */
+TEST_F(HQCodecTest, InvalidHeaders) {
+  // Valid but incomplete QPACK
+  std::array<uint8_t, 5> headersMissingField = {0x00, 0x00, 0xC0, 0xC1, 0xD1};
+  hq::writeHeaders(queue_,
+                   folly::IOBuf::wrapBuffer(headersMissingField.data(),
+                                            headersMissingField.size()));
+  parse();
+  // never seen, parser is paused
+  downstreamCodec_->onIngressEOF();
+  EXPECT_EQ(callbacks_.messageBegin, 1);
+  EXPECT_EQ(callbacks_.headersComplete, 0);
+  EXPECT_EQ(callbacks_.messageComplete, 0);
+  EXPECT_EQ(callbacks_.streamErrors, 1);
+  EXPECT_EQ(callbacks_.sessionErrors, 0);
+  EXPECT_EQ(callbacks_.lastParseError->getHttpStatusCode(), 400);
+}
+
+TEST_F(HQCodecTest, ParserStopsAfterPushPromiseError) {
+  std::array<uint8_t, 3> qpackError{0xC0, 0x00};
+  hq::writePushPromise(
+      queue_,
+      0,
+      folly::IOBuf::copyBuffer(qpackError.data(), qpackError.size()));
+
+  // push promises should be parsed by the client
+  parseUpstream();
+  // Never seen, error
+  upstreamCodec_->onIngressEOF();
+
+  EXPECT_EQ(callbacks_.messageBegin, 1);
+  EXPECT_EQ(callbacks_.messageComplete, 0);
+  EXPECT_EQ(callbacks_.streamErrors, 0);
+  EXPECT_EQ(callbacks_.sessionErrors, 1);
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_QPACK_DECOMPRESSION_FAILED);
+}
+
+TEST_F(HQCodecTest, ZeroLengthData) {
+  hq::writeData(queue_, folly::IOBuf::create(1));
+  parse();
+  EXPECT_EQ(callbacks_.messageBegin, 0);
+  EXPECT_EQ(callbacks_.headersComplete, 0);
+  EXPECT_EQ(callbacks_.bodyCalls, 0);
+  EXPECT_EQ(callbacks_.messageComplete, 0);
+  EXPECT_EQ(callbacks_.streamErrors, 0);
+  EXPECT_EQ(callbacks_.sessionErrors, 0);
+}
+
+TEST_F(HQCodecTest, TruncatedStream) {
+  writeFrameHeaderManual(
+      queue_, static_cast<uint64_t>(FrameType::HEADERS), 0x10);
+  parse();
+  downstreamCodec_->onIngressEOF();
+  EXPECT_EQ(callbacks_.messageComplete, 0);
+  EXPECT_EQ(callbacks_.streamErrors, 0);
+  EXPECT_EQ(callbacks_.sessionErrors, 1);
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_FRAME_ERROR);
+
+  // A second EOF goes nowhere, because the codec is in error
+  downstreamCodec_->onIngressEOF();
+  EXPECT_EQ(callbacks_.messageComplete, 0);
+  EXPECT_EQ(callbacks_.streamErrors, 0);
+  EXPECT_EQ(callbacks_.sessionErrors, 1);
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_FRAME_ERROR);
+}
+
+TEST_F(HQCodecTest, BasicConnect) {
+  std::string authority = "myhost:1234";
+  HTTPMessage request;
+  request.setMethod(HTTPMethod::CONNECT);
+  request.getHeaders().add(proxygen::HTTP_HEADER_HOST, authority);
+  auto streamId = upstreamCodec_->createStream();
+  upstreamCodec_->generateHeader(queue_, streamId, request, false /* eom */);
+
+  parse();
+  callbacks_.expectMessage(false, 1, "");
+  EXPECT_EQ(HTTPMethod::CONNECT, callbacks_.msg->getMethod());
+  const auto& headers = callbacks_.msg->getHeaders();
+  EXPECT_EQ(authority, headers.getSingleOrEmpty(proxygen::HTTP_HEADER_HOST));
+}
+
+TEST_F(HQCodecTest, OnlyDataAfterConnect) {
+  std::string authority = "myhost:1234";
+  HTTPMessage request;
+  request.setMethod(HTTPMethod::CONNECT);
+  request.getHeaders().add(proxygen::HTTP_HEADER_HOST, authority);
+  auto streamId = upstreamCodec_->createStream();
+  upstreamCodec_->generateHeader(queue_, streamId, request, false /* eom */);
+
+  parse();
+  callbacks_.expectMessage(false, 1, "");
+  EXPECT_EQ(HTTPMethod::CONNECT, callbacks_.msg->getMethod());
+  const auto& headers = callbacks_.msg->getHeaders();
+  EXPECT_EQ(authority, headers.getSingleOrEmpty(proxygen::HTTP_HEADER_HOST));
+
+  writeValidFrame(queue_, FrameType::HEADERS);
+  parse();
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED);
 }
 
 TEST_F(HQCodecTest, MultipleSettingsUpstream) {
@@ -854,6 +613,8 @@ TEST_F(HQCodecTest, MultipleSettingsUpstream) {
   EXPECT_EQ(callbacks_.headerFrames, 1);
   EXPECT_EQ(callbacks_.streamErrors, 0);
   EXPECT_EQ(callbacks_.sessionErrors, 1);
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED);
 }
 
 TEST_F(HQCodecTest, MultipleSettingsDownstream) {
@@ -863,6 +624,60 @@ TEST_F(HQCodecTest, MultipleSettingsDownstream) {
   EXPECT_EQ(callbacks_.headerFrames, 1);
   EXPECT_EQ(callbacks_.streamErrors, 0);
   EXPECT_EQ(callbacks_.sessionErrors, 1);
+  EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+            HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED);
+}
+
+TEST_F(HQCodecTest, PriorityCallback) {
+  // SETTINGS is a must have
+  writeValidFrame(queueCtrl_, FrameType::SETTINGS);
+  writeValidFrame(queueCtrl_, FrameType::PRIORITY_UPDATE);
+  parseControl(CodecType::CONTROL_DOWNSTREAM);
+  EXPECT_EQ(1, callbacks_.urgency);
+  EXPECT_TRUE(callbacks_.incremental);
+}
+
+TEST_F(HQCodecTest, PushPriorityCallback) {
+  // SETTINGS is a must have
+  writeValidFrame(queueCtrl_, FrameType::SETTINGS);
+  writeValidFrame(queueCtrl_, FrameType::PUSH_PRIORITY_UPDATE);
+  parseControl(CodecType::CONTROL_DOWNSTREAM);
+  EXPECT_EQ(1, callbacks_.urgency);
+  EXPECT_TRUE(callbacks_.incremental);
+}
+
+template <class T>
+void HQCodecTestFixture<T>::testGoaway(HQControlCodec& codec,
+                                       uint64_t drainId) {
+  writeValidFrame(queueCtrl_, FrameType::SETTINGS);
+  // Send draining goaway
+  EXPECT_FALSE(codec.isWaitingToDrain());
+  auto size = codec.generateGoaway(
+      queueCtrl_, HTTPCodec::MaxStreamID, ErrorCode::NO_ERROR, nullptr);
+  EXPECT_GT(size, 0);
+  EXPECT_TRUE(codec.isWaitingToDrain());
+
+  // HQControlCodec doesn't track the id's on it's own.  Asking for a second
+  // goaway with MaxStreamID will send a final with MAX
+  size = codec.generateGoaway(
+      queueCtrl_, HTTPCodec::MaxStreamID, ErrorCode::NO_ERROR, nullptr);
+  EXPECT_GT(size, 0);
+
+  // Ask for another GOAWAY, no-op
+  size = codec.generateGoaway(
+      queueCtrl_, HTTPCodec::MaxStreamID, ErrorCode::NO_ERROR, nullptr);
+  EXPECT_EQ(size, 0);
+  parseControl(CodecType::CONTROL_DOWNSTREAM);
+  EXPECT_EQ(callbacks_.goaways, 2);
+  EXPECT_THAT(callbacks_.goawayStreamIds, ElementsAre(drainId, drainId));
+}
+
+TEST_F(HQCodecTest, ServerGoaway) {
+  testGoaway(downstreamControlCodec_, kMaxClientBidiStreamId);
+}
+
+TEST_F(HQCodecTest, ClientGoaway) {
+  testGoaway(upstreamControlCodec_, kMaxPushId + 1);
 }
 
 struct FrameAllowedParams {
@@ -914,6 +729,12 @@ std::string frameParamsToTestName(
       break;
     case FrameType::MAX_PUSH_ID:
       testName += "MaxPushID";
+      break;
+    case FrameType::PRIORITY_UPDATE:
+      testName += "PriorityUpdate";
+      break;
+    case FrameType::PUSH_PRIORITY_UPDATE:
+      testName += "PushPriorityUpdate";
       break;
     default:
       testName +=
@@ -967,6 +788,8 @@ TEST_P(HQCodecTestFrameAllowed, FrameAllowedOnCodec) {
   // If an error was triggered, check that any additional parse call does not
   // raise another error, and that no new bytes are parsed
   if (!GetParam().allowed) {
+    EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+              HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED);
     auto lenBefore = 0;
     auto lenAfter = 0;
     switch (GetParam().codecType) {
@@ -995,6 +818,8 @@ TEST_P(HQCodecTestFrameAllowed, FrameAllowedOnCodec) {
     EXPECT_EQ(callbacks_.headerFrames, expectedFrames);
     EXPECT_EQ(callbacks_.streamErrors, 0);
     EXPECT_EQ(callbacks_.sessionErrors, 1);
+    EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+              HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED);
   }
 }
 
@@ -1019,6 +844,14 @@ INSTANTIATE_TEST_CASE_P(
         (FrameAllowedParams){CodecType::DOWNSTREAM,
                              FrameType(*getGreaseId(hq::kMaxGreaseIdIndex)),
                              true},
+        (FrameAllowedParams){
+            CodecType::DOWNSTREAM, FrameType::PRIORITY_UPDATE, false},
+        (FrameAllowedParams){
+            CodecType::DOWNSTREAM, FrameType::PUSH_PRIORITY_UPDATE, false},
+        (FrameAllowedParams){
+            CodecType::UPSTREAM, FrameType::PRIORITY_UPDATE, false},
+        (FrameAllowedParams){
+            CodecType::UPSTREAM, FrameType::PUSH_PRIORITY_UPDATE, false},
         // HQ Upstream Ingress Control Codec
         (FrameAllowedParams){
             CodecType::CONTROL_UPSTREAM, FrameType::DATA, false},
@@ -1038,6 +871,11 @@ INSTANTIATE_TEST_CASE_P(
             CodecType::CONTROL_UPSTREAM, FrameType(*getGreaseId(12345)), true},
         (FrameAllowedParams){
             CodecType::CONTROL_UPSTREAM, FrameType(*getGreaseId(54321)), true},
+        (FrameAllowedParams){
+            CodecType::CONTROL_UPSTREAM, FrameType::PRIORITY_UPDATE, false},
+        (FrameAllowedParams){CodecType::CONTROL_UPSTREAM,
+                             FrameType::PUSH_PRIORITY_UPDATE,
+                             false},
         // HQ Downstream Ingress Control Codec
         (FrameAllowedParams){
             CodecType::CONTROL_DOWNSTREAM, FrameType::DATA, false},
@@ -1050,14 +888,17 @@ INSTANTIATE_TEST_CASE_P(
         (FrameAllowedParams){
             CodecType::CONTROL_DOWNSTREAM, FrameType::PUSH_PROMISE, false},
         (FrameAllowedParams){
-            CodecType::CONTROL_DOWNSTREAM, FrameType::GOAWAY, false},
-        (FrameAllowedParams){
             CodecType::CONTROL_DOWNSTREAM, FrameType::MAX_PUSH_ID, true},
         (FrameAllowedParams){CodecType::CONTROL_DOWNSTREAM,
                              FrameType(*getGreaseId(98765)),
                              true},
         (FrameAllowedParams){CodecType::CONTROL_DOWNSTREAM,
                              FrameType(*getGreaseId(567879)),
+                             true},
+        (FrameAllowedParams){
+            CodecType::CONTROL_DOWNSTREAM, FrameType::PRIORITY_UPDATE, true},
+        (FrameAllowedParams){CodecType::CONTROL_DOWNSTREAM,
+                             FrameType::PUSH_PRIORITY_UPDATE,
                              true}),
     frameParamsToTestName);
 
@@ -1070,6 +911,10 @@ TEST_P(H1QCodecTestFrameAllowed, FrameAllowedOnH1qControlCodec) {
   EXPECT_EQ(callbacks_.headerFrames, GetParam().allowed ? 1 : 0);
   EXPECT_EQ(callbacks_.streamErrors, 0);
   EXPECT_EQ(callbacks_.sessionErrors, GetParam().allowed ? 0 : 1);
+  if (!GetParam().allowed) {
+    EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+              HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED);
+  }
 }
 
 INSTANTIATE_TEST_CASE_P(
@@ -1129,6 +974,19 @@ TEST_P(HQCodecTestFrameBeforeSettings, FrameAllowedOnH1qControlCodec) {
   EXPECT_EQ(callbacks_.headerFrames, GetParam().allowed ? 1 : 0);
   EXPECT_EQ(callbacks_.streamErrors, 0);
   EXPECT_EQ(callbacks_.sessionErrors, GetParam().allowed ? 0 : 1);
+  if (!GetParam().allowed) {
+    if (GetParam().codecType == CodecType::H1Q_CONTROL_DOWNSTREAM ||
+        GetParam().codecType == CodecType::H1Q_CONTROL_UPSTREAM ||
+        GetParam().frameType == hq::FrameType::DATA ||
+        GetParam().frameType == hq::FrameType::HEADERS ||
+        GetParam().frameType == hq::FrameType::PUSH_PROMISE) {
+      EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+                HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED);
+    } else {
+      EXPECT_EQ(callbacks_.lastParseError->getHttp3ErrorCode(),
+                HTTP3::ErrorCode::HTTP_MISSING_SETTINGS);
+    }
+  }
 }
 
 INSTANTIATE_TEST_CASE_P(

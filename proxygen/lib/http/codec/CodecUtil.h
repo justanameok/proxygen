@@ -31,6 +31,9 @@ namespace proxygen {
 #define CODEC_STATIC static
 #endif
 
+folly::Optional<HTTPPriority> parseHTTPPriorityString(
+    folly::StringPiece priorityString);
+
 class CodecUtil {
  public:
   // If these are needed elsewhere, we can move them to a more generic
@@ -160,4 +163,5 @@ class CodecUtil {
 
   static const std::bitset<256>& perHopHeaderCodes();
 };
+
 } // namespace proxygen

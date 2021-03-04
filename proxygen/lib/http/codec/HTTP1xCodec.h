@@ -54,10 +54,19 @@ class HTTP1xCodec : public HTTPCodec {
   bool isWaitingToDrain() const override {
     return disableKeepalivePending_ && keepalive_;
   }
-  // If the session has been upgraded we will send EOF (or RST if needed)
-  // on egress complete
+  bool isEgressBusy() const {
+    return ((transportDirection_ == TransportDirection::DOWNSTREAM &&
+             responsePending_) ||
+            // count egress busy for non-upgraded upstream codecs with a
+            // pending response.  HTTP/1.x servers are inconsistent in how they
+            // interpret an EOF with a pending response, so don't trigger one
+            // unless the connection was upgraded.
+            (transportDirection_ == TransportDirection::UPSTREAM &&
+             (requestPending_ || (!egressUpgrade_ && responsePending_))));
+  }
+  // True if the session requires an EOF (or RST) to terminate the message
   bool closeOnEgressComplete() const override {
-    return egressUpgrade_;
+    return !isEgressBusy() && !isReusable();
   }
   bool supportsParallelRequests() const override {
     return false;
@@ -65,11 +74,13 @@ class HTTP1xCodec : public HTTPCodec {
   bool supportsPushTransactions() const override {
     return false;
   }
-  void generateHeader(folly::IOBufQueue& writeBuf,
-                      StreamID txn,
-                      const HTTPMessage& msg,
-                      bool eom = false,
-                      HTTPHeaderSize* size = nullptr) override;
+  void generateHeader(
+      folly::IOBufQueue& writeBuf,
+      StreamID txn,
+      const HTTPMessage& msg,
+      bool eom = false,
+      HTTPHeaderSize* size = nullptr,
+      folly::Optional<HTTPHeaders> extraHeaders = folly::none) override;
   size_t generateBody(folly::IOBufQueue& writeBuf,
                       StreamID txn,
                       std::unique_ptr<folly::IOBuf> chain,

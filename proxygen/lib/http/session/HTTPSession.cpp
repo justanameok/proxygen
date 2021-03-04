@@ -51,7 +51,7 @@ static constexpr folly::StringPiece kServerLabel =
 
 namespace proxygen {
 
-HTTPSession::HTTPSession(folly::HHWheelTimer* transactionTimeouts,
+HTTPSession::HTTPSession(folly::HHWheelTimer* wheelTimer,
                          AsyncTransport::UniquePtr sock,
                          const SocketAddress& localAddr,
                          const SocketAddress& peerAddr,
@@ -59,7 +59,7 @@ HTTPSession::HTTPSession(folly::HHWheelTimer* transactionTimeouts,
                          unique_ptr<HTTPCodec> codec,
                          const TransportInfo& tinfo,
                          InfoCallback* infoCallback)
-    : HTTPSession(WheelTimerInstance(transactionTimeouts),
+    : HTTPSession(WheelTimerInstance(wheelTimer),
                   std::move(sock),
                   localAddr,
                   peerAddr,
@@ -69,7 +69,7 @@ HTTPSession::HTTPSession(folly::HHWheelTimer* transactionTimeouts,
                   infoCallback) {
 }
 
-HTTPSession::HTTPSession(const WheelTimerInstance& timeout,
+HTTPSession::HTTPSession(const WheelTimerInstance& wheelTimer,
                          AsyncTransport::UniquePtr sock,
                          const SocketAddress& localAddr,
                          const SocketAddress& peerAddr,
@@ -83,11 +83,11 @@ HTTPSession::HTTPSession(const WheelTimerInstance& timeout,
                       tinfo,
                       infoCallback,
                       std::move(codec),
-                      timeout,
+                      wheelTimer,
                       HTTPCodec::StreamID(0)),
       writeTimeout_(this),
       sock_(std::move(sock)),
-      timeout_(timeout),
+      wheelTimer_(wheelTimer),
       draining_(false),
       started_(false),
       writesDraining_(false),
@@ -128,8 +128,6 @@ HTTPSession::HTTPSession(const WheelTimerInstance& timeout,
   if (!sock_->isReplaySafe()) {
     sock_->setReplaySafetyCallback(this);
   }
-
-  rateLimitingCounters_ = std::make_shared<RateLimitingCounters>();
 }
 
 uint32_t HTTPSession::getCertAuthSettingVal() {
@@ -220,6 +218,13 @@ void HTTPSession::setupCodec() {
     codec_.addFilters(std::unique_ptr<FlowControlFilter>(connFlowControl_));
     // if we really support switching from spdy <-> h2, we need to update
     // existing flow control filter
+  }
+  if (codec_->supportsParallelRequests() && !controlMessageRateLimitFilter_ &&
+      sock_) {
+    controlMessageRateLimitFilter_ =
+        new ControlMessageRateLimitFilter(&getEventBase()->timer());
+    codec_.addFilters(std::unique_ptr<ControlMessageRateLimitFilter>(
+        controlMessageRateLimitFilter_));
   }
 
   codec_.setCallback(this);
@@ -334,8 +339,8 @@ void HTTPSession::readTimeoutExpired() noexcept {
   notifyPendingShutdown();
   auto controller = getController();
   if (controller && codec_->isWaitingToDrain()) {
-    timeout_.scheduleTimeout(&drainTimeout_,
-                             controller->getGracefulShutdownTimeout());
+    wheelTimer_.scheduleTimeout(&drainTimeout_,
+                                controller->getGracefulShutdownTimeout());
   }
 }
 
@@ -460,6 +465,9 @@ void HTTPSession::readDataAvailable(size_t readSize) noexcept {
   VLOG(10) << "read completed on " << *this << ", bytes=" << readSize;
 
   DestructorGuard dg(this);
+  if (pingProber_) {
+    pingProber_->refreshTimeout(/*onIngress=*/true);
+  }
   resetTimeout();
 
   if (ingressError_) {
@@ -485,6 +493,10 @@ void HTTPSession::readBufferAvailable(std::unique_ptr<IOBuf> readBuf) noexcept {
   FOLLY_SCOPED_TRACE_SECTION(
       "HTTPSession - readBufferAvailable", "readSize", readSize);
   VLOG(5) << "read completed on " << *this << ", bytes=" << readSize;
+
+  if (pingProber_) {
+    pingProber_->refreshTimeout(/*onIngress=*/true);
+  }
 
   DestructorGuard dg(this);
   resetTimeout();
@@ -996,12 +1008,7 @@ void HTTPSession::onMessageComplete(HTTPCodec::StreamID streamID,
     return;
   }
 
-  // txnIngressFinished = !1xx response
-  const bool txnIngressFinished =
-      txn->isDownstream() || !txn->extraResponseExpected();
-  if (txnIngressFinished) {
-    decrementTransactionCount(txn, true, false);
-  }
+  decrementTransactionCount(txn, true, false);
   txn->onIngressEOM();
 
   // The codec knows, based on the semantics of whatever protocol it
@@ -1023,8 +1030,7 @@ void HTTPSession::onMessageComplete(HTTPCodec::StreamID streamID,
   //
   // There may be additional checks that need to be performed that are
   // specific to requests or responses, so we call the subclass too.
-  if (!codec_->isReusable() && txnIngressFinished &&
-      !codec_->supportsParallelRequests()) {
+  if (!codec_->isReusable() && !codec_->supportsParallelRequests()) {
     VLOG(4) << *this << " cannot reuse ingress";
     shutdownTransport(true, false);
   }
@@ -1069,12 +1075,7 @@ void HTTPSession::onError(HTTPCodec::StreamID streamID,
         infoCallback_->onRequestBegin(*this);
       }
       if (txn) {
-        if (incrementDirectErrorHandlingInCurInterval()) {
-          // The rate limit has been exceeded
-          return;
-        } else {
-          handleErrorDirectly(txn, error);
-        }
+        handleErrorDirectly(txn, error);
       }
     } else if (newTxn) {
       onNewTransactionParseError(streamID, error);
@@ -1087,12 +1088,7 @@ void HTTPSession::onError(HTTPCodec::StreamID streamID,
 
   if (!txn->getHandler() &&
       txn->getEgressState() == HTTPTransactionEgressSM::State::Start) {
-    if (incrementDirectErrorHandlingInCurInterval()) {
-      // The rate limit has been exceeded
-      return;
-    } else {
-      handleErrorDirectly(txn, error);
-    }
+    handleErrorDirectly(txn, error);
     return;
   }
 
@@ -1108,10 +1104,6 @@ void HTTPSession::onAbort(HTTPCodec::StreamID streamID, ErrorCode code) {
   VLOG(4) << "stream abort on " << *this << ", streamID=" << streamID
           << ", code=" << getErrorCodeString(code);
 
-  if (incrementNumControlMsgsInCurInterval(http2::FrameType::RST_STREAM)) {
-    return;
-  }
-
   HTTPTransaction* txn = findTransaction(streamID);
   if (!txn) {
     VLOG(4) << *this
@@ -1126,6 +1118,19 @@ void HTTPSession::onAbort(HTTPCodec::StreamID streamID, ErrorCode code) {
   ex.setProxygenError(kErrorStreamAbort);
   ex.setCodecStatusCode(code);
   DestructorGuard dg(this);
+
+  if (abortPushesOnRST_ && isDownstream() && !txn->getAssocTxnId() &&
+      code == ErrorCode::CANCEL) {
+    VLOG(4) << "Cancel all push txns because assoc txn has been cancelled.";
+    for (auto it = txn->getPushedTransactions().begin();
+         it != txn->getPushedTransactions().end();) {
+      auto pushTxn = findTransaction(*it);
+      ++it;
+      DCHECK(pushTxn != nullptr);
+      pushTxn->onError(ex);
+    }
+  }
+
   auto exTxns = txn->getExTransactions();
   for (auto it = exTxns.begin(); it != exTxns.end(); ++it) {
     auto exTxn = findTransaction(*it);
@@ -1212,10 +1217,6 @@ void HTTPSession::onGoaway(uint64_t lastGoodStreamID,
 void HTTPSession::onPingRequest(uint64_t data) {
   VLOG(4) << *this << " got ping request with data=" << data;
 
-  if (incrementNumControlMsgsInCurInterval(http2::FrameType::PING)) {
-    return;
-  }
-
   TimePoint timestamp = getCurrentTime();
 
   uint64_t bytesScheduledBeforePing = 0;
@@ -1248,6 +1249,9 @@ void HTTPSession::onPingRequest(uint64_t data) {
 
 void HTTPSession::onPingReply(uint64_t data) {
   VLOG(4) << *this << " got ping reply with id=" << data;
+  if (pingProber_) {
+    pingProber_->onPingReply(data);
+  }
   if (infoCallback_) {
     infoCallback_->onPingReplyReceived();
   }
@@ -1272,9 +1276,6 @@ void HTTPSession::onWindowUpdate(HTTPCodec::StreamID streamID,
 
 void HTTPSession::onSettings(const SettingsList& settings) {
   DestructorGuard g(this);
-  if (incrementNumControlMsgsInCurInterval(http2::FrameType::SETTINGS)) {
-    return;
-  }
   for (auto& setting : settings) {
     if (setting.id == SettingsId::INITIAL_WINDOW_SIZE) {
       onSetSendWindow(setting.value);
@@ -1302,9 +1303,8 @@ void HTTPSession::onSettingsAck() {
 }
 
 void HTTPSession::onPriority(HTTPCodec::StreamID streamID,
-                             const HTTPMessage::HTTPPriority& pri) {
-  if (!getHTTP2PrioritiesEnabled() ||
-      incrementNumControlMsgsInCurInterval(http2::FrameType::PRIORITY)) {
+                             const HTTPMessage::HTTP2Priority& pri) {
+  if (!getHTTP2PrioritiesEnabled()) {
     return;
   }
   http2::PriorityUpdate h2Pri{
@@ -1317,6 +1317,9 @@ void HTTPSession::onPriority(HTTPCodec::StreamID streamID,
     // virtual node
     txnEgressQueue_.addOrUpdatePriorityNode(streamID, h2Pri);
   }
+}
+
+void HTTPSession::onPriority(HTTPCodec::StreamID, const HTTPPriority&) {
 }
 
 void HTTPSession::onCertificateRequest(uint16_t requestId,
@@ -1788,6 +1791,11 @@ size_t HTTPSession::sendPriority(HTTPTransaction* txn,
   return sendPriorityImpl(txn->getID(), pri);
 }
 
+size_t HTTPSession::changePriority(HTTPTransaction* /*txn*/,
+                                   HTTPPriority /*pri*/) noexcept {
+  return 0;
+}
+
 void HTTPSession::setSecondAuthManager(
     std::unique_ptr<SecondaryAuthManagerBase> secondAuthManager) {
   secondAuthManager_ = std::move(secondAuthManager);
@@ -1795,6 +1803,20 @@ void HTTPSession::setSecondAuthManager(
 
 SecondaryAuthManagerBase* HTTPSession::getSecondAuthManager() const {
   return secondAuthManager_.get();
+}
+
+void HTTPSession::setControlMessageRateLimitParams(
+    uint32_t maxControlMsgsPerInterval,
+    uint32_t maxDirectErrorHandlingPerInterval,
+    std::chrono::milliseconds controlMsgIntervalDuration,
+    std::chrono::milliseconds directErrorHandlingIntervalDuration) {
+  if (controlMessageRateLimitFilter_) {
+    controlMessageRateLimitFilter_->setParams(
+        maxControlMsgsPerInterval,
+        maxDirectErrorHandlingPerInterval,
+        controlMsgIntervalDuration,
+        directErrorHandlingIntervalDuration);
+  }
 }
 
 /**
@@ -1924,6 +1946,9 @@ void HTTPSession::detach(HTTPTransaction* txn) noexcept {
 
   if (transactions_.empty()) {
     HTTPSessionBase::setLatestActive();
+    if (pingProber_) {
+      pingProber_->cancelProbes();
+    }
     if (infoCallback_) {
       infoCallback_->onDeactivateConnection(*this);
     }
@@ -2018,12 +2043,17 @@ bool HTTPSession::getCurrentTransportInfo(TransportInfo* tinfo) {
     tinfo->appProtocol = transportInfo_.appProtocol;
     tinfo->sslError = transportInfo_.sslError;
 #if defined(__linux__) || defined(__FreeBSD__)
+    tinfo->recvwnd = tinfo->tcpinfo.tcpi_rcv_space
+                     << tinfo->tcpinfo.tcpi_rcv_wscale;
     // update connection transport info with the latest RTT
     if (tinfo->tcpinfo.tcpi_rtt > 0) {
       transportInfo_.tcpinfo.tcpi_rtt = tinfo->tcpinfo.tcpi_rtt;
       transportInfo_.rtt = std::chrono::microseconds(tinfo->tcpinfo.tcpi_rtt);
     }
     transportInfo_.rtx = tinfo->rtx;
+#elif defined(__APPLE__)
+    tinfo->recvwnd = tinfo->tcpinfo.tcpi_rcv_wnd
+                     << tinfo->tcpinfo.tcpi_rcv_wscale;
 #endif
     return true;
   }
@@ -2206,7 +2236,7 @@ void HTTPSession::runLoopCallback() noexcept {
 
     if (!writeTimeout_.isScheduled()) {
       // Any performance concern here?
-      timeout_.scheduleTimeout(&writeTimeout_);
+      wheelTimer_.scheduleTimeout(&writeTimeout_);
     }
     numActiveWrites_++;
     VLOG(4) << *this << " writing " << len
@@ -2500,12 +2530,86 @@ bool HTTPSession::shouldShutdown() const {
 }
 
 size_t HTTPSession::sendPing() {
-  uint64_t data = folly::Random::rand64();
+  return sendPing(folly::Random::rand64());
+}
+
+size_t HTTPSession::sendPing(uint64_t data) {
   const size_t bytes = codec_->generatePingRequest(writeBuf_, data);
   if (bytes) {
     scheduleWrite();
   }
   return bytes;
+}
+
+void HTTPSession::enablePingProbes(std::chrono::seconds interval,
+                                   std::chrono::seconds timeout,
+                                   bool extendIntervalOnIngress,
+                                   bool immediate) {
+  if (isHTTP2CodecProtocol(codec_->getProtocol())) {
+    pingProber_ = std::make_unique<PingProber>(
+        *this, interval, timeout, extendIntervalOnIngress, immediate);
+  }
+}
+
+HTTPSession::PingProber::PingProber(HTTPSession& session,
+                                    std::chrono::seconds interval,
+                                    std::chrono::seconds timeout,
+                                    bool extendIntervalOnIngress,
+                                    bool immediate)
+    : session_(session),
+      interval_(interval),
+      timeout_(timeout),
+      extendIntervalOnIngress_(extendIntervalOnIngress) {
+  if (immediate) {
+    timeoutExpired();
+  } else if (session_.getNumStreams() > 0) {
+    startProbes();
+  } // else session will start them when a stream is created
+}
+
+void HTTPSession::PingProber::startProbes() {
+  refreshTimeout(/*onIngress=*/false);
+}
+
+void HTTPSession::PingProber::cancelProbes() {
+  if (pingVal_) {
+    VLOG(4) << "Canceling active probe sess=" << session_;
+    pingVal_.reset();
+  }
+  cancelTimeout();
+}
+
+void HTTPSession::PingProber::refreshTimeout(bool onIngress) {
+  if (!pingVal_ && (!onIngress || extendIntervalOnIngress_)) {
+    VLOG(4) << "Scheduling next ping probe for sess=" << session_;
+    session_.getEventBase()->timer().scheduleTimeout(this, interval_);
+  }
+}
+
+void HTTPSession::PingProber::timeoutExpired() noexcept {
+  if (pingVal_) {
+    VLOG(3) << "Ping probe timed out, dropping connection sess=" << session_;
+    session_.dropConnection("Ping probe timed out");
+  } else {
+    pingVal_ = folly::Random::rand64();
+    VLOG(4) << "Sending ping probe with value=" << *pingVal_
+            << " sess=" << session_;
+    session_.sendPing(*pingVal_);
+    session_.getEventBase()->timer().scheduleTimeout(this, timeout_);
+  }
+}
+
+void HTTPSession::PingProber::onPingReply(uint64_t pingVal) {
+  if (!pingVal_ || *pingVal_ != pingVal) {
+    // This can happen if someone calls sendPing() manually
+    VLOG(3) << "Received unexpected PING reply=" << pingVal << " expecting="
+            << ((pingVal_) ? folly::to<std::string>(*pingVal_)
+                           : std::string("none"));
+    return;
+  }
+  VLOG(4) << "Received expected ping, rescheduling";
+  pingVal_.reset();
+  refreshTimeout(/*onIngress=*/false);
 }
 
 HTTPCodec::StreamID HTTPSession::sendPriority(http2::PriorityUpdate pri) {
@@ -2572,6 +2676,9 @@ HTTPTransaction* HTTPSession::createTransaction(
   }
 
   if (transactions_.empty()) {
+    if (pingProber_) {
+      pingProber_->startProbes();
+    }
     if (infoCallback_) {
       infoCallback_->onActivateConnection(*this);
     }
@@ -2589,15 +2696,16 @@ HTTPTransaction* HTTPSession::createTransaction(
                             getNumTxnServed(),
                             *this,
                             txnEgressQueue_,
-                            timeout_.getWheelTimer(),
-                            timeout_.getDefaultTimeout(),
+                            wheelTimer_.getWheelTimer(),
+                            wheelTimer_.getDefaultTimeout(),
                             sessionStats_,
                             codec_->supportsStreamFlowControl(),
                             initialReceiveWindow_,
                             getCodecSendWindowSize(),
                             priority,
                             assocStreamID,
-                            exAttributes));
+                            exAttributes,
+                            setIngressTimeoutAfterEom_));
 
   CHECK(matchPair.second) << "Emplacement failed, despite earlier "
                              "existence check.";
@@ -2645,71 +2753,6 @@ void HTTPSession::incrementIncomingStreams(HTTPTransaction* txn) {
   DCHECK(txn);
   incomingStreams_++;
   txn->setIsCountedTowardsStreamLimit();
-}
-
-bool HTTPSession::incrementNumControlMsgsInCurInterval(
-    http2::FrameType frameType) {
-  if (rateLimitingCounters_->numControlMsgsInCurrentInterval == 0) {
-    // The first time we get a "control message", we schedule a
-    // function on the event base that clears out the value of
-    // numControlMsgsInCurrentInterval. Once it is cleared, the next
-    // such event that fires causes the function to be scheduled, and the
-    // cycle repeats.
-    scheduleResetNumControlMsgs();
-  }
-
-  (rateLimitingCounters_->numControlMsgsInCurrentInterval)++;
-  if (rateLimitingCounters_->numControlMsgsInCurrentInterval >
-      maxControlMsgsPerInterval_) {
-    LOG(ERROR) << " dropping connection due to too many control messages, "
-               << "num control messages = "
-               << rateLimitingCounters_->numControlMsgsInCurrentInterval
-               << ", most recent frame type = " << getFrameTypeString(frameType)
-               << " " << *this;
-    dropConnection();
-    return true;
-  }
-
-  return false;
-}
-
-bool HTTPSession::incrementDirectErrorHandlingInCurInterval() {
-  if (rateLimitingCounters_->numDirectErrorHandlingInCurrentInterval == 0) {
-    // The first time a direct error handling event fires, we schedule a
-    // function on the event base that clears out the value of
-    // numDirectErrorHandlingInCurrentInterval. Once it is cleared, the next
-    // such event that fires causes the function to be scheduled, and the
-    // cycle repeats.
-    scheduleResetDirectErrorHandling();
-  }
-
-  (rateLimitingCounters_->numDirectErrorHandlingInCurrentInterval)++;
-  if (rateLimitingCounters_->numDirectErrorHandlingInCurrentInterval >
-      maxDirectErrorHandlingPerInterval_) {
-    LOG(ERROR) << " dropping connection due to too many newly created txns "
-               << " when directly handling errors,"
-               << "num direct error handling cases = "
-               << rateLimitingCounters_->numDirectErrorHandlingInCurrentInterval
-               << " " << *this;
-    dropConnection();
-    return true;
-  }
-
-  return false;
-}
-
-void HTTPSession::scheduleResetNumControlMsgs() {
-  auto ptr = rateLimitingCounters_;
-  sock_->getEventBase()->runAfterDelay(
-      [ptr]() { ptr->numControlMsgsInCurrentInterval = 0; },
-      controlMsgIntervalDuration_);
-}
-
-void HTTPSession::scheduleResetDirectErrorHandling() {
-  auto ptr = rateLimitingCounters_;
-  sock_->getEventBase()->runAfterDelay(
-      [ptr]() { ptr->numDirectErrorHandlingInCurrentInterval = 0; },
-      directErrorHandlingIntervalDuration_);
 }
 
 void HTTPSession::writeSuccess() noexcept {
@@ -2820,8 +2863,13 @@ void HTTPSession::onSessionParseError(const HTTPException& error) {
       scheduleWrite();
     }
   }
-  setCloseReason(ConnectionCloseReason::SESSION_PARSE_ERROR);
-  shutdownTransport(true, true);
+  if (error.hasProxygenError() && error.getProxygenError() == kErrorDropped) {
+    // Codec is requesting a connection drop
+    dropConnection();
+  } else {
+    setCloseReason(ConnectionCloseReason::SESSION_PARSE_ERROR);
+    shutdownTransport(true, true);
+  }
 }
 
 void HTTPSession::onNewTransactionParseError(HTTPCodec::StreamID streamID,
@@ -2943,9 +2991,9 @@ void HTTPSession::onConnectionSendWindowClosed() {
   }
   auto timeout = flowControlTimeout_.getTimeoutDuration();
   if (timeout != std::chrono::milliseconds(0)) {
-    timeout_.scheduleTimeout(&flowControlTimeout_, timeout);
+    wheelTimer_.scheduleTimeout(&flowControlTimeout_, timeout);
   } else {
-    timeout_.scheduleTimeout(&flowControlTimeout_);
+    wheelTimer_.scheduleTimeout(&flowControlTimeout_);
   }
 }
 

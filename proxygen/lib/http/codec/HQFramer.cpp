@@ -6,6 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <proxygen/lib/http/HTTPPriorityFunctions.h>
+#include <proxygen/lib/http/codec/CodecUtil.h>
 #include <proxygen/lib/http/codec/HQFramer.h>
 #include <proxygen/lib/http/codec/HQUtils.h>
 #include <quic/codec/QuicInteger.h>
@@ -29,45 +31,10 @@ folly::Optional<uint64_t> getGreaseId(uint64_t n) {
   return (0x1F * n) + 0x21;
 }
 
-bool isInternalPushId(PushId pushId) {
-  return pushId & kPushIdMask;
-}
-
-bool isExternalPushId(PushId pushId) {
-  return !(pushId & kPushIdMask);
-}
-
-// Return 0 if (lhs < rhs), 1 otherwise
-bool comparePushId(PushId lhs, PushId rhs) {
-  return ((lhs & ~kPushIdMask) < (rhs & ~kPushIdMask)) ? false : true;
-}
-
-bool isValidPushId(folly::Optional<PushId> maxAllowedPushId, PushId pushId) {
-  if (!maxAllowedPushId.hasValue()) {
-    VLOG(3) << __func__ << "maximum push ID value has not been set";
-    return false;
-  } else if (!comparePushId(maxAllowedPushId.value(), pushId)) {
-    VLOG(3) << __func__ << "given pushid=" << pushId
-            << "exceeds possible push ID value "
-            << "maxAllowedPushId_=" << maxAllowedPushId.value();
-    return false;
-  }
-
-  return true;
-}
-
-bool frameAffectsCompression(FrameType t) {
-  return t == FrameType::HEADERS || t == FrameType::PUSH_PROMISE;
-}
-
 ParseResult parseData(folly::io::Cursor& cursor,
                       const FrameHeader& header,
                       std::unique_ptr<folly::IOBuf>& outBuf) noexcept {
   DCHECK_LE(header.length, cursor.totalLength());
-  // DATA frames MUST contain a non-zero-length payload
-  if (header.length == 0) {
-    return HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_DATA;
-  }
   cursor.clone(outBuf, header.length);
   return folly::none;
 }
@@ -90,12 +57,12 @@ ParseResult parseCancelPush(folly::io::Cursor& cursor,
 
   auto pushId = quic::decodeQuicInteger(cursor, frameLength);
   if (!pushId) {
-    return HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_CANCEL_PUSH;
+    return HTTP3::ErrorCode::HTTP_FRAME_ERROR;
   }
-  outPushId = pushId->first | kPushIdMask;
+  outPushId = pushId->first;
   frameLength -= pushId->second;
   if (frameLength != 0) {
-    return HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_CANCEL_PUSH;
+    return HTTP3::ErrorCode::HTTP_FRAME_ERROR;
   }
 
   return folly::none;
@@ -109,8 +76,7 @@ decodeSettingValue(folly::io::Cursor& cursor,
   // read the setting value
   auto settingValue = quic::decodeQuicInteger(cursor, frameLength);
   if (!settingValue) {
-    return folly::makeUnexpected(
-        HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_SETTINGS);
+    return folly::makeUnexpected(HTTP3::ErrorCode::HTTP_FRAME_ERROR);
   }
   auto value = settingValue->first;
   frameLength -= settingValue->second;
@@ -136,7 +102,7 @@ ParseResult parseSettings(folly::io::Cursor& cursor,
   while (frameLength > 0) {
     auto settingIdRes = quic::decodeQuicInteger(cursor, frameLength);
     if (!settingIdRes) {
-      return HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_SETTINGS;
+      return HTTP3::ErrorCode::HTTP_FRAME_ERROR;
     }
     frameLength -= settingIdRes->second;
 
@@ -146,6 +112,7 @@ ParseResult parseSettings(folly::io::Cursor& cursor,
       return settingValue.error();
     }
 
+    // TODO: Duped id should trigger H3_SETTINGS_ERROR
     if (settingValue->has_value()) {
       settings.emplace_back(settingId, settingValue->value());
     }
@@ -163,9 +130,9 @@ ParseResult parsePushPromise(folly::io::Cursor& cursor,
 
   auto pushId = quic::decodeQuicInteger(cursor, frameLength);
   if (!pushId) {
-    return HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_PUSH_PROMISE;
+    return HTTP3::ErrorCode::HTTP_FRAME_ERROR;
   }
-  outPushId = pushId->first | kPushIdMask;
+  outPushId = pushId->first;
   frameLength -= pushId->second;
 
   cursor.clone(outBuf, frameLength);
@@ -181,12 +148,12 @@ ParseResult parseGoaway(folly::io::Cursor& cursor,
 
   auto streamId = quic::decodeQuicInteger(cursor, frameLength);
   if (!streamId) {
-    return HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_GOAWAY;
+    return HTTP3::ErrorCode::HTTP_FRAME_ERROR;
   }
   outStreamId = streamId->first;
   frameLength -= streamId->second;
   if (frameLength != 0) {
-    return HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_GOAWAY;
+    return HTTP3::ErrorCode::HTTP_FRAME_ERROR;
   }
 
   return folly::none;
@@ -201,14 +168,38 @@ ParseResult parseMaxPushId(folly::io::Cursor& cursor,
 
   auto pushId = quic::decodeQuicInteger(cursor, frameLength);
   if (!pushId) {
-    return HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_MAX_PUSH_ID;
+    return HTTP3::ErrorCode::HTTP_FRAME_ERROR;
   }
-  outPushId = pushId->first | kPushIdMask;
+  outPushId = pushId->first;
   frameLength -= pushId->second;
   if (frameLength != 0) {
-    return HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_MAX_PUSH_ID;
+    return HTTP3::ErrorCode::HTTP_FRAME_ERROR;
   }
 
+  return folly::none;
+}
+
+ParseResult parsePriorityUpdate(folly::io::Cursor& cursor,
+                                const FrameHeader& header,
+                                HTTPCodec::StreamID& outId,
+                                HTTPPriority& priorityUpdate) noexcept {
+  DCHECK_LE(header.length, cursor.totalLength());
+  auto length = header.length;
+  auto id = quic::decodeQuicInteger(cursor, length);
+  if (!id) {
+    return HTTP3::ErrorCode::HTTP_ID_ERROR;
+  }
+  outId = id->first;
+  auto bufferLength = length - id->second;
+  auto buf = folly::IOBuf::create(bufferLength);
+  cursor.pull((void*)(buf->data()), bufferLength);
+  buf->append(bufferLength);
+  auto httpPriority = httpPriorityFromString(
+      folly::StringPiece(folly::ByteRange(buf->data(), buf->length())));
+  if (!httpPriority) {
+    return HTTP3::ErrorCode::HTTP_FRAME_ERROR;
+  }
+  priorityUpdate = *httpPriority;
   return folly::none;
 }
 
@@ -267,8 +258,6 @@ WriteResult writeHeaders(IOBufQueue& queue,
 
 WriteResult writeCancelPush(folly::IOBufQueue& writeBuf,
                             PushId pushId) noexcept {
-  DCHECK(pushId & kPushIdMask);
-  pushId = pushId & ~kPushIdMask;
   auto pushIdSize = quic::getQuicIntegerSize(pushId);
   if (pushIdSize.hasError()) {
     return pushIdSize;
@@ -319,8 +308,6 @@ WriteResult writePushPromise(IOBufQueue& queue,
                              PushId pushId,
                              std::unique_ptr<folly::IOBuf> data) noexcept {
   DCHECK(data);
-  DCHECK(pushId & kPushIdMask);
-  pushId = pushId & ~kPushIdMask;
   auto pushIdSize = quic::getQuicIntegerSize(pushId);
   if (pushIdSize.hasError()) {
     return pushIdSize;
@@ -354,8 +341,6 @@ WriteResult writeGoaway(folly::IOBufQueue& writeBuf,
 
 WriteResult writeMaxPushId(folly::IOBufQueue& writeBuf,
                            PushId maxPushId) noexcept {
-  DCHECK(maxPushId & kPushIdMask);
-  maxPushId &= ~kPushIdMask;
   auto maxPushIdSize = quic::getQuicIntegerSize(maxPushId);
   if (maxPushIdSize.hasError()) {
     return maxPushIdSize;
@@ -367,6 +352,53 @@ WriteResult writeMaxPushId(folly::IOBufQueue& writeBuf,
                             appender.writeBE(val);
                           });
   return writeSimpleFrame(writeBuf, FrameType::MAX_PUSH_ID, queue.move());
+}
+
+WriteResult writePriorityUpdate(folly::IOBufQueue& writeBuf,
+                                quic::StreamId streamId,
+                                folly::StringPiece priorityUpdate) noexcept {
+  auto type = FrameType::PRIORITY_UPDATE;
+  auto streamIdSize = quic::getQuicIntegerSize(streamId);
+  if (streamIdSize.hasError()) {
+    return streamIdSize;
+  }
+  IOBufQueue queue(IOBufQueue::cacheChainLength());
+  QueueAppender appender(&queue, *streamIdSize);
+  quic::encodeQuicInteger(streamId,
+                          [&appender](auto val) { appender.writeBE(val); });
+  appender.pushAtMost((const uint8_t*)(priorityUpdate.data()),
+                      priorityUpdate.size());
+  return writeSimpleFrame(writeBuf, type, queue.move());
+}
+
+WriteResult writePushPriorityUpdate(
+    folly::IOBufQueue& writeBuf,
+    hq::PushId pushId,
+    folly::StringPiece priorityUpdate) noexcept {
+  auto type = FrameType::PUSH_PRIORITY_UPDATE;
+  auto streamIdSize = quic::getQuicIntegerSize(pushId);
+  if (streamIdSize.hasError()) {
+    return streamIdSize;
+  }
+  IOBufQueue queue(IOBufQueue::cacheChainLength());
+  QueueAppender appender(&queue, *streamIdSize);
+  quic::encodeQuicInteger(pushId,
+                          [&appender](auto val) { appender.writeBE(val); });
+  appender.pushAtMost((const uint8_t*)(priorityUpdate.data()),
+                      priorityUpdate.size());
+  return writeSimpleFrame(writeBuf, type, queue.move());
+}
+
+WriteResult writeStreamPreface(folly::IOBufQueue& writeBuf,
+                               uint64_t streamPreface) noexcept {
+  auto streamPrefaceSize = quic::getQuicIntegerSize(streamPreface);
+  if (streamPrefaceSize.hasError()) {
+    return streamPrefaceSize;
+  }
+  QueueAppender appender(&writeBuf, *streamPrefaceSize);
+  quic::encodeQuicInteger(streamPreface,
+                          [&appender](auto val) { appender.writeBE(val); });
+  return *streamPrefaceSize;
 }
 
 const char* getFrameTypeString(FrameType type) {
@@ -385,6 +417,10 @@ const char* getFrameTypeString(FrameType type) {
       return "GOAWAY";
     case FrameType::MAX_PUSH_ID:
       return "MAX_PUSH_ID";
+    case FrameType::PRIORITY_UPDATE:
+      return "PRIORITY_UPDATE";
+    case FrameType::PUSH_PRIORITY_UPDATE:
+      return "PUSH_PRIORITY_UPDATE";
     default:
       if (isGreaseId(static_cast<uint64_t>(type))) {
         return "GREASE";
@@ -394,6 +430,11 @@ const char* getFrameTypeString(FrameType type) {
   }
   LOG(FATAL) << "Unreachable";
   return "";
+}
+
+std::ostream& operator<<(std::ostream& os, FrameType type) {
+  os << getFrameTypeString(type);
+  return os;
 }
 
 }} // namespace proxygen::hq

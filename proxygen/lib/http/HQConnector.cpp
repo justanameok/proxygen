@@ -7,6 +7,7 @@
  */
 
 #include <proxygen/lib/http/HQConnector.h>
+
 #include <folly/io/SocketOptionMap.h>
 #include <folly/io/async/AsyncSSLSocket.h>
 #include <proxygen/lib/http/session/HQSession.h>
@@ -54,7 +55,6 @@ void HQConnector::connect(
     std::chrono::milliseconds connectTimeout,
     const SocketOptionMap& socketOptions,
     folly::Optional<std::string> sni,
-    std::shared_ptr<quic::Logger> logger,
     std::shared_ptr<quic::QLogger> qLogger,
     std::shared_ptr<quic::LoopDetectorCallback> quicLoopDetectorCallback,
     std::shared_ptr<quic::QuicTransportStatsCallback>
@@ -78,7 +78,6 @@ void HQConnector::connect(
   quicClient->setCongestionControllerFactory(
       std::make_shared<quic::DefaultCongestionControllerFactory>());
   quicClient->setTransportSettings(transportSettings_);
-  quicClient->setLogger(std::move(logger));
   quicClient->setQLogger(std::move(qLogger));
   quicClient->setLoopDetectorCallback(std::move(quicLoopDetectorCallback));
   quicClient->setTransportStatsCallback(std::move(quicTransportStatsCallback));

@@ -84,22 +84,31 @@ void SPDYStatsFilter::onSettingsAck() {
 }
 
 void SPDYStatsFilter::onPriority(StreamID stream,
-                                 const HTTPMessage::HTTPPriority& pri) {
+                                 const HTTPMessage::HTTP2Priority& pri) {
   counters_->recordIngressPriority();
   callback_->onPriority(stream, pri);
 }
 
-void SPDYStatsFilter::generateHeader(folly::IOBufQueue& writeBuf,
-                                     StreamID stream,
-                                     const HTTPMessage& msg,
-                                     bool eom,
-                                     HTTPHeaderSize* size) {
+void SPDYStatsFilter::onPriority(StreamID stream,
+                                 const HTTPPriority& priority) {
+  counters_->recordIngressPriority();
+  callback_->onPriority(stream, priority);
+}
+
+void SPDYStatsFilter::generateHeader(
+    folly::IOBufQueue& writeBuf,
+    StreamID stream,
+    const HTTPMessage& msg,
+    bool eom,
+    HTTPHeaderSize* size,
+    folly::Optional<HTTPHeaders> extraHeaders) {
   if (call_->getTransportDirection() == TransportDirection::UPSTREAM) {
     counters_->recordEgressSynStream();
   } else {
     counters_->recordEgressSynReply();
   }
-  return call_->generateHeader(writeBuf, stream, msg, eom, size);
+  return call_->generateHeader(
+      writeBuf, stream, msg, eom, size, std::move(extraHeaders));
 }
 
 void SPDYStatsFilter::generatePushPromise(folly::IOBufQueue& writeBuf,
@@ -169,11 +178,26 @@ size_t SPDYStatsFilter::generateWindowUpdate(folly::IOBufQueue& writeBuf,
   return call_->generateWindowUpdate(writeBuf, stream, delta);
 }
 
-size_t SPDYStatsFilter::generatePriority(folly::IOBufQueue& writeBuf,
-                                         StreamID stream,
-                                         const HTTPMessage::HTTPPriority& pri) {
+size_t SPDYStatsFilter::generatePriority(
+    folly::IOBufQueue& writeBuf,
+    StreamID stream,
+    const HTTPMessage::HTTP2Priority& pri) {
   counters_->recordEgressPriority();
   return call_->generatePriority(writeBuf, stream, pri);
+}
+
+size_t SPDYStatsFilter::generatePriority(folly::IOBufQueue& writeBuf,
+                                         StreamID streamId,
+                                         HTTPPriority pri) {
+  counters_->recordEgressPriority();
+  return call_->generatePriority(writeBuf, streamId, pri);
+}
+
+size_t SPDYStatsFilter::generatePushPriority(folly::IOBufQueue& writeBuf,
+                                             StreamID pushId,
+                                             HTTPPriority pri) {
+  counters_->recordEgressPriority();
+  return call_->generatePushPriority(writeBuf, pushId, pri);
 }
 
 } // namespace proxygen

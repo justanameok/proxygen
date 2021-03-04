@@ -120,7 +120,7 @@ class HTTPSessionBase : public wangle::ManagedConnection {
                   const wangle::TransportInfo& tinfo,
                   InfoCallback* infoCallback,
                   std::unique_ptr<HTTPCodec> codec,
-                  const WheelTimerInstance& timeout,
+                  const WheelTimerInstance& wheelTimer,
                   HTTPCodec::StreamID rootNodeId);
 
   virtual ~HTTPSessionBase() {
@@ -422,7 +422,7 @@ class HTTPSessionBase : public wangle::ManagedConnection {
   // Implments a map from generic priority level to HTTP/2 priority.
   class PriorityAdapter {
    public:
-    virtual folly::Optional<const HTTPMessage::HTTPPriority> getHTTPPriority(
+    virtual folly::Optional<const HTTPMessage::HTTP2Priority> getHTTPPriority(
         uint8_t level) = 0;
     virtual ~PriorityAdapter() = default;
   };
@@ -442,7 +442,7 @@ class HTTPSessionBase : public wangle::ManagedConnection {
 
   virtual void attachThreadLocals(folly::EventBase* eventBase,
                                   folly::SSLContextPtr sslContext,
-                                  const WheelTimerInstance& timeout,
+                                  const WheelTimerInstance& wheelTimer,
                                   HTTPSessionStats* stats,
                                   FilterIteratorFn fn,
                                   HeaderCodec::Stats* headerCodecStats,
@@ -480,7 +480,7 @@ class HTTPSessionBase : public wangle::ManagedConnection {
    */
   virtual void drain() = 0;
 
-  virtual folly::Optional<const HTTPMessage::HTTPPriority> getHTTPPriority(
+  virtual folly::Optional<const HTTPMessage::HTTP2Priority> getHTTPPriority(
       uint8_t level) = 0;
 
   /**
@@ -497,6 +497,22 @@ class HTTPSessionBase : public wangle::ManagedConnection {
   void setConnectionToken(
       const HTTPTransaction::ConnectionToken& token) noexcept {
     connectionToken_ = token;
+  }
+
+  // Use the protocol's ping feature to test liveness of the peer.  Send a ping
+  // every interval seconds.  If the ping is not returned by timeout, drop the
+  // connection.
+  // If extendIntervalOnIngress is true, then any ingress data will reset the
+  // timer until the next PING.
+  // If immediate is true, send a ping immediately.  Otherwise, wait one
+  // interval.
+  virtual void enablePingProbes(std::chrono::seconds interval,
+                                std::chrono::seconds timeout,
+                                bool extendIntervalOnIngress,
+                                bool immediate = false) = 0;
+
+  void setIngressTimeoutAfterEom(bool setIngressTimeoutAfterEom) noexcept {
+    setIngressTimeoutAfterEom_ = setIngressTimeoutAfterEom;
   }
 
  protected:
@@ -636,6 +652,11 @@ class HTTPSessionBase : public wangle::ManagedConnection {
    * Optional connection token associated with this session.
    */
   folly::Optional<HTTPTransaction::ConnectionToken> connectionToken_;
+
+  /**
+   * Indicates whether ingress timeout has to be scheduled after EOM is sent.
+   */
+  bool setIngressTimeoutAfterEom_{false};
 
  private:
   // Underlying controller_ is marked as private so that callers must utilize

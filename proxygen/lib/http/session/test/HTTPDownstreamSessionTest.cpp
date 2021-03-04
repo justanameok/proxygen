@@ -285,7 +285,6 @@ class HTTPDownstreamTest : public testing::Test {
                 EXPECT_EQ(msg->getStatusCode(), 100);
               }))
           .RetiresOnSaturation();
-      EXPECT_CALL(callbacks, onMessageComplete(_, _)).RetiresOnSaturation();
     }
     clientCodec_->setCallback(&callbacks);
     parseOutput(*clientCodec_);
@@ -2289,16 +2288,43 @@ TEST_F(HTTPDownstreamSessionTest, BigExplcitChunkWrite) {
 TEST_F(HTTPDownstreamSessionTest, HttpUpgradeNonNative) {
   auto handler = addSimpleStrictHandler();
 
-  handler->expectHeaders([&handler] {
-    handler->sendHeaders(101, 0, true, {{"Upgrade", "blarf"}});
+  handler->expectHeaders([&handler, this] {
+    // TODO: there is serious weirdness in this case.  The HTTP parser must
+    // be paused from this point until the response headers are sent.  If we
+    // delay the 101 headers by 1 loop, the case breaks without the
+    // pause/resume
+    handler->txn_->pauseIngress();
+    eventBase_.runInLoop([&handler] {
+      handler->sendHeaders(101, 0, true, {{"Upgrade", "blarf"}});
+      handler->txn_->resumeIngress();
+    });
   });
   EXPECT_CALL(*handler, onUpgrade(UpgradeProtocol::TCP));
-  handler->expectEOM([&handler] { handler->txn_->sendEOM(); });
-  handler->expectDetachTransaction();
 
-  sendRequest(getUpgradeRequest("blarf"));
+  sendRequest(getUpgradeRequest("blarf"), /*eom=*/false);
+  // Enough to receive the request, wait a loop, send the response
+  flushRequestsAndLoopN(3);
+
+  // Now send random blarf data
+  handler->expectBody([&handler] {
+    handler->txn_->sendBody(makeBuf(100));
+    handler->txn_->sendEOM();
+  });
+
+  folly::IOBufQueue bq{folly::IOBufQueue::cacheChainLength()};
+  bq.append(makeBuf(100));
+  transport_->addReadEvent(bq, milliseconds(0));
+
+  // The server sent EOM, which means transport writes should be closed now
+  flushRequestsAndLoopN(2);
+  EXPECT_FALSE(transport_->good());
+
+  // Add EOF from the client to complete the teardown
+  handler->expectEOM();
+  handler->expectDetachTransaction();
   expectDetachSession();
-  flushRequestsAndLoop(true);
+  transport_->addReadEOF(milliseconds(0));
+  eventBase_.loop();
 }
 
 // Test upgrade to a protocol unknown to HTTPSession, but don't switch
@@ -3371,13 +3397,13 @@ TEST_F(HTTP2DownstreamSessionTest, TestPriorityWeightsTinyRatio) {
   InSequence enforceOrder;
   auto req1 = getGetRequest();
   auto req2 = getGetRequest();
-  req1.setHTTP2Priority(HTTPMessage::HTTPPriority{0, false, 255});
-  req2.setHTTP2Priority(HTTPMessage::HTTPPriority{0, false, 0});
+  req1.setHTTP2Priority(HTTPMessage::HTTP2Priority{0, false, 255});
+  req2.setHTTP2Priority(HTTPMessage::HTTP2Priority{0, false, 0});
 
   sendRequest(req1);
   auto id2 = sendRequest(req2);
-  req1.setHTTP2Priority(HTTPMessage::HTTPPriority{id2, false, 255});
-  req2.setHTTP2Priority(HTTPMessage::HTTPPriority{id2, false, 0});
+  req1.setHTTP2Priority(HTTPMessage::HTTP2Priority{id2, false, 255});
+  req2.setHTTP2Priority(HTTPMessage::HTTP2Priority{id2, false, 0});
   sendRequest(req1);
   sendRequest(req2);
 
@@ -3498,11 +3524,11 @@ TEST_F(HTTP2DownstreamSessionTest, TestPriorityDependentTransactions) {
   //       16
   InSequence enforceOrder;
   auto req1 = getGetRequest();
-  req1.setHTTP2Priority(HTTPMessage::HTTPPriority{0, false, 15});
+  req1.setHTTP2Priority(HTTPMessage::HTTP2Priority{0, false, 15});
   auto id1 = sendRequest(req1);
 
   auto req2 = getGetRequest();
-  req2.setHTTP2Priority(HTTPMessage::HTTPPriority{id1, false, 15});
+  req2.setHTTP2Priority(HTTPMessage::HTTP2Priority{id1, false, 15});
   sendRequest(req2);
 
   auto handler1 = addSimpleStrictHandler();
@@ -3565,11 +3591,11 @@ TEST_F(HTTP2DownstreamSessionTest, TestDisablePriorities) {
 
   InSequence enforceOrder;
   HTTPMessage req1 = getGetRequest();
-  req1.setHTTP2Priority(HTTPMessage::HTTPPriority{0, false, 0});
+  req1.setHTTP2Priority(HTTPMessage::HTTP2Priority{0, false, 0});
   sendRequest(req1);
 
   HTTPMessage req2 = getGetRequest();
-  req2.setHTTP2Priority(HTTPMessage::HTTPPriority{0, false, 255});
+  req2.setHTTP2Priority(HTTPMessage::HTTP2Priority{0, false, 255});
   sendRequest(req2);
 
   auto handler1 = addSimpleStrictHandler();
@@ -3595,7 +3621,7 @@ TEST_F(HTTP2DownstreamSessionTest, TestPriorityWeights) {
   // virtual priority node with pri=4
   auto priGroupID = clientCodec_->createStream();
   clientCodec_->generatePriority(
-      requests_, priGroupID, HTTPMessage::HTTPPriority(0, false, 3));
+      requests_, priGroupID, HTTPMessage::HTTP2Priority(0, false, 3));
   // Both txn's are at equal pri=16
   auto id1 = sendRequest();
   auto id2 = sendRequest();
@@ -3627,7 +3653,7 @@ TEST_F(HTTP2DownstreamSessionTest, TestPriorityWeights) {
 
   // update handler2 to be in the pri-group (which has lower weight)
   clientCodec_->generatePriority(
-      requests_, id2, HTTPMessage::HTTPPriority(priGroupID, false, 15));
+      requests_, id2, HTTPMessage::HTTP2Priority(priGroupID, false, 15));
 
   eventBase_.runInLoop([&] {
     handler1->txn_->sendBody(makeBuf(4 * 1024));
@@ -3643,7 +3669,7 @@ TEST_F(HTTP2DownstreamSessionTest, TestPriorityWeights) {
 
   // update vnode weight to match txn1 weight
   clientCodec_->generatePriority(
-      requests_, priGroupID, HTTPMessage::HTTPPriority(0, false, 15));
+      requests_, priGroupID, HTTPMessage::HTTP2Priority(0, false, 15));
   eventBase_.runInLoop([&] {
     handler1->txn_->sendBody(makeBuf(4 * 1024));
     handler1->txn_->sendEOM();
@@ -3669,13 +3695,13 @@ TEST_F(HTTP2DownstreamSessionTest, TestPriorityWeights) {
 TEST_F(HTTP2DownstreamSessionTest, TestControlMsgRateLimitExceeded) {
   auto streamid = clientCodec_->createStream();
 
-  httpSession_->setMaxControlMsgsPerInterval(10);
+  httpSession_->setControlMessageRateLimitParams(10);
 
   // Send 7 PRIORITY, 1 SETTINGS, and 3 PING frames. This should exceed the
   // limit of 10, causing us to drop the connection.
   for (int i = 0; i < 7; i++) {
     clientCodec_->generatePriority(
-        requests_, streamid, HTTPMessage::HTTPPriority(0, false, 3));
+        requests_, streamid, HTTPMessage::HTTP2Priority(0, false, 3));
   }
 
   clientCodec_->generateSettings(requests_);
@@ -3692,14 +3718,13 @@ TEST_F(HTTP2DownstreamSessionTest, TestControlMsgRateLimitExceeded) {
 TEST_F(HTTP2DownstreamSessionTest, TestControlMsgResetRateLimitTouched) {
   auto streamid = clientCodec_->createStream();
 
-  httpSession_->setMaxControlMsgsPerInterval(10);
-  httpSession_->setControlMsgIntervalDuration(0);
+  httpSession_->setControlMessageRateLimitParams(10, 100, milliseconds(0));
 
   // Send 7 PRIORITY, 1 SETTINGS, and 2 PING frames. This doesn't exceed the
   // limit of 10.
   for (int i = 0; i < 7; i++) {
     clientCodec_->generatePriority(
-        requests_, streamid, HTTPMessage::HTTPPriority(0, false, 3));
+        requests_, streamid, HTTPMessage::HTTP2Priority(0, false, 3));
   }
 
   clientCodec_->generateSettings(requests_);
@@ -3710,13 +3735,13 @@ TEST_F(HTTP2DownstreamSessionTest, TestControlMsgResetRateLimitTouched) {
 
   // We should reset the number of control frames seen, enabling us to send
   // more without hitting the rate limit
-  flushRequestsAndLoopN(2);
+  flushRequestsAndLoop();
 
   // Send 10 control frames. This is just within the rate limits that we have
   // set.
   for (int i = 0; i < 5; i++) {
     clientCodec_->generatePriority(
-        requests_, streamid, HTTPMessage::HTTPPriority(0, false, 3));
+        requests_, streamid, HTTPMessage::HTTP2Priority(0, false, 3));
   }
 
   clientCodec_->generateSettings(requests_);
@@ -3733,8 +3758,7 @@ TEST_F(HTTP2DownstreamSessionTest, TestControlMsgResetRateLimitTouched) {
 }
 
 TEST_F(HTTP2DownstreamSessionTest, DirectErrorHandlingLimitTouched) {
-  httpSession_->setMaxDirectErrorHandlingPerInterval(10);
-  httpSession_->setDirectErrorHandlingIntervalDuration(0);
+  httpSession_->setControlMessageRateLimitParams(100, 10, milliseconds(0));
 
   // Send ten messages, each of which cause direct error handling. Since
   // this doesn't exceed the limit, this should not cause the connection
@@ -3766,8 +3790,7 @@ TEST_F(HTTP2DownstreamSessionTest, DirectErrorHandlingLimitTouched) {
 }
 
 TEST_F(HTTP2DownstreamSessionTest, DirectErrorHandlingLimitExceeded) {
-  httpSession_->setMaxDirectErrorHandlingPerInterval(10);
-  httpSession_->setDirectErrorHandlingIntervalDuration(0);
+  httpSession_->setControlMessageRateLimitParams(100, 10, milliseconds(0));
 
   // Send eleven messages, each of which causes direct error handling. Since
   // this exceeds the limit, the connection should be dropped.
@@ -4187,4 +4210,107 @@ TEST_F(HTTP2DownstreamSessionTest, DropAlreadyShuttingDownConnection) {
 
   expectDetachSession();
   httpSession_->dropConnection("Async drop");
+}
+
+TEST_F(HTTP2DownstreamSessionTest, PingProbes) {
+  // Send an immediate ping probe, and send a reply
+  httpSession_->enablePingProbes(std::chrono::seconds(1),
+                                 std::chrono::seconds(1),
+                                 /*extendIntervalOnIngress=*/true,
+                                 /*immediate=*/true);
+  eventBase_.loopOnce();
+  uint64_t pingVal = 0;
+  EXPECT_CALL(callbacks_, onPingRequest(_)).WillOnce(SaveArg<0>(&pingVal));
+  parseOutput(*clientCodec_);
+  clientCodec_->generatePingReply(requests_, pingVal);
+  flushRequestsAndLoopN(1);
+  httpSession_->closeWhenIdle();
+  expectDetachSession();
+  flushRequestsAndLoopN(1);
+}
+
+TEST_F(HTTP2DownstreamSessionTest, PingProbeTimeout) {
+  // Send an immediate ping probe, but don't reply.  Connection is dropped.
+  httpSession_->enablePingProbes(std::chrono::seconds(1),
+                                 std::chrono::seconds(1),
+                                 /*extendIntervalOnIngress=*/true,
+                                 /*immediate=*/true);
+  eventBase_.loopOnce();
+  uint64_t pingVal = 0;
+  EXPECT_CALL(callbacks_, onPingRequest(_)).WillOnce(SaveArg<0>(&pingVal));
+  parseOutput(*clientCodec_);
+  expectDetachSession();
+  flushRequestsAndLoop();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, PingProbeTimeoutRefresh) {
+  httpSession_->enablePingProbes(std::chrono::seconds(1),
+                                 std::chrono::seconds(1),
+                                 /*extendIntervalOnIngress=*/true,
+                                 /*immediate=*/false);
+  // Don't send an immediate probe.  Send a request after 250ms, which starts
+  // the probe interval timer. The ping probe interval fires at 1250 and times
+  // out at 2250.
+  proxygen::TimePoint start = getCurrentTime();
+  auto handler = addSimpleStrictHandler();
+  handler->expectHeaders();
+  handler->expectEOM();
+  eventBase_.runAfterDelay(
+      [this] {
+        sendRequest();
+        flushRequests();
+      },
+      250);
+  handler->expectError();
+  handler->expectDetachTransaction();
+  expectDetachSession();
+  eventBase_.loop();
+  auto duration = millisecondsBetween(getCurrentTime(), start);
+  EXPECT_GE(duration.count(), 2250);
+}
+
+TEST_F(HTTP2DownstreamSessionTest, PingProbeInvalid) {
+  // Send an immediate ping probe, send a reply with a different value.
+  // It doesn't drop the connection.
+  httpSession_->enablePingProbes(std::chrono::seconds(1),
+                                 std::chrono::seconds(1),
+                                 /*extendIntervalOnIngress=*/true,
+                                 /*immediate=*/true);
+  eventBase_.loopOnce();
+  uint64_t pingVal = 0;
+  EXPECT_CALL(callbacks_, onPingRequest(_)).WillOnce(SaveArg<0>(&pingVal));
+  parseOutput(*clientCodec_);
+  // Send a reply for a ping the prober didn't send (we could send one with
+  // sendPing, but meh)
+  clientCodec_->generatePingReply(requests_, pingVal + 1);
+  flushRequestsAndLoopN(1);
+  httpSession_->closeWhenIdle();
+  expectDetachSession();
+  eventBase_.loop();
+}
+
+TEST_F(HTTP2DownstreamSessionTest, CancelPingProbesOnRequest) {
+  // Send an immediate ping probe, don't reply, but send a request/response.
+  // When the session goes idle, the ping probe timeout should be cancelled.
+  httpSession_->enablePingProbes(std::chrono::seconds(1),
+                                 std::chrono::seconds(1),
+                                 /*extendIntervalOnIngress=*/true,
+                                 /*immediate=*/true);
+  eventBase_.loopOnce();
+  auto handler = addSimpleStrictHandler();
+  sendRequest();
+  handler->expectHeaders();
+  handler->expectEOM([&handler, this] {
+    handler->sendReplyWithBody(200, 100);
+    eventBase_.runAfterDelay([this] { httpSession_->timeoutExpired(); }, 1250);
+  });
+  handler->expectDetachTransaction();
+  HTTPSession::DestructorGuard g(httpSession_);
+  expectDetachSession();
+  flushRequestsAndLoop();
+  EXPECT_CALL(callbacks_, onPingRequest(_));
+  parseOutput(*clientCodec_);
+  // Session idle times out
+  EXPECT_EQ(httpSession_->getConnectionCloseReason(),
+            ConnectionCloseReason::TIMEOUT);
 }

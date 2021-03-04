@@ -18,6 +18,7 @@
 #include <proxygen/lib/http/codec/HQUnidirectionalCodec.h>
 #include <proxygen/lib/http/codec/HQUtils.h>
 #include <proxygen/lib/http/codec/HTTP1xCodec.h>
+#include <proxygen/lib/http/codec/HTTP2Framer.h>
 #include <proxygen/lib/http/codec/HTTPChecks.h>
 #include <proxygen/lib/http/codec/HTTPCodec.h>
 #include <proxygen/lib/http/codec/HTTPCodecFilter.h>
@@ -66,6 +67,7 @@ using HQVersionType = std::underlying_type<HQVersion>::type;
 struct QuicProtocolInfo : public wangle::ProtocolInfo {
   virtual ~QuicProtocolInfo() override = default;
 
+  folly::Optional<quic::ConnectionId> clientChosenDestConnectionId;
   folly::Optional<quic::ConnectionId> clientConnectionId;
   folly::Optional<quic::ConnectionId> serverConnectionId;
   folly::Optional<quic::TransportSettings> transportSettings;
@@ -281,6 +283,9 @@ class HQSession
 
   void onSettings(const SettingsList& settings);
 
+  void onPriority(quic::StreamId streamId, const HTTPPriority& pri);
+  void onPushPriority(hq::PushId pushId, const HTTPPriority& pri);
+
   folly::AsyncTransport* getTransport() override {
     return nullptr;
   }
@@ -398,6 +403,9 @@ class HQSession
     return 0;
   }
 
+  size_t sendPriority(HTTPCodec::StreamID id, HTTPPriority pri);
+  size_t sendPushPriority(hq::PushId pushId, HTTPPriority pri);
+
   /**
    * Get session-level transport info.
    * NOTE: The protocolInfo will be set to connection-level pointer.
@@ -472,7 +480,7 @@ class HQSession
     notifyPendingShutdown();
   }
 
-  folly::Optional<const HTTPMessage::HTTPPriority> getHTTPPriority(
+  folly::Optional<const HTTPMessage::HTTP2Priority> getHTTPPriority(
       uint8_t /*level*/) override {
     return folly::none;
   }
@@ -490,16 +498,16 @@ class HQSession
     return sock_ && sock_->good() ? sock_->getPeerAddress() : peerAddr_;
   }
 
-  void setPartiallyReliableCallbacks(quic::StreamId id);
-
-  bool isPartialReliabilityEnabled() const noexcept {
-    CHECK(versionUtils_);
-    return versionUtils_->isPartialReliabilityEnabled();
-  }
-
   // Returns creation time point for logging of handshake duration
   const std::chrono::steady_clock::time_point& getCreatedTime() const {
     return createTime_;
+  }
+
+  void enablePingProbes(std::chrono::seconds /*interval*/,
+                        std::chrono::seconds /*timeout*/,
+                        bool /*extendIntervalOnIngress*/,
+                        bool /*immediate*/) override {
+    // TODO
   }
 
  protected:
@@ -539,11 +547,12 @@ class HQSession
 
   void invokeOnIngressStreams(std::function<void(HQStreamTransportBase*)> fn,
                               bool includeDetached = false) {
-    invokeOnStreamsImpl(std::move(fn),
-                        [this, includeDetached](quic::StreamId id) {
-                          return this->findIngressStream(id, includeDetached);
-                        },
-                        true);
+    invokeOnStreamsImpl(
+        std::move(fn),
+        [this, includeDetached](quic::StreamId id) {
+          return this->findIngressStream(id, includeDetached);
+        },
+        true);
   }
 
   void invokeOnNonDetachedStreams(
@@ -647,18 +656,6 @@ class HQSession
 
   void rejectStream(quic::StreamId /* id */) override;
 
-  bool isPartialReliabilityEnabled(quic::StreamId /* id */) override;
-
-  void onPartialDataAvailable(
-      quic::StreamId /* id */,
-      const HQUnidirStreamDispatcher::Callback::PeekData& /* data */) override;
-
-  void processExpiredData(quic::StreamId /* id */,
-                          uint64_t /* offset */) override;
-
-  void processRejectedData(quic::StreamId /* id */,
-                           uint64_t /* offset */) override;
-
   folly::Optional<hq::UnidirectionalStreamType> parseStreamPreface(
       uint64_t preface) override;
 
@@ -757,6 +754,12 @@ class HQSession
                    quic::StreamId id,
                    HTTP3::ErrorCode err);
 
+  // Get extra HTTP headers we want to add to the HTTPMessage in sendHeaders.
+  virtual folly::Optional<HTTPHeaders> getExtraHeaders(const HTTPMessage&,
+                                                       quic::StreamId) {
+    return folly::none;
+  }
+
   proxygen::TransportDirection direction_;
   std::chrono::milliseconds transactionsTimeout_;
   TimePoint transportStart_;
@@ -795,7 +798,7 @@ class HQSession
   // Use ALPN to set the correct version utils strategy.
   void setVersionUtils();
 
-  // Used during 2-phased GOAWAY messages
+  // Used during 2-phased GOAWAY messages, and EOF sending.
   void onDeliveryAck(quic::StreamId id,
                      uint64_t offset,
                      std::chrono::microseconds rtt) override;
@@ -1063,6 +1066,15 @@ class HQSession
       session_.onSettings(settings);
     }
 
+    void onPriority(HTTPCodec::StreamID id, const HTTPPriority& pri) override {
+      session_.onPriority(id, pri);
+    }
+
+    void onPushPriority(HTTPCodec::StreamID id,
+                        const HTTPPriority& pri) override {
+      session_.onPushPriority(id, pri);
+    }
+
     std::unique_ptr<hq::HQUnidirectionalCodec> ingressCodec_;
     bool readEOF_{false};
   };
@@ -1079,7 +1091,7 @@ class HQSession
         TransportDirection direction,
         quic::StreamId streamId,
         uint32_t seqNo,
-        const WheelTimerInstance& timeout,
+        const WheelTimerInstance& wheelTimer,
         HTTPSessionStats* stats = nullptr,
         http2::PriorityUpdate priority = hqDefaultPriority,
         folly::Optional<HTTPCodec::StreamID> parentTxnId = HTTPCodec::NoStream,
@@ -1111,12 +1123,6 @@ class HQSession
     // Process data from QUIC onDataAvailable callback.
     void processPeekData(
         const folly::Range<quic::QuicSocket::PeekIterator>& peekData);
-
-    // Process QUIC onDataExpired callback.
-    void processDataExpired(uint64_t streamOffset);
-
-    // Process QUIC onDataRejected callback.
-    void processDataRejected(uint64_t streamOffset);
 
     // QuicSocket::DeliveryCallback
     void onDeliveryAck(quic::StreamId id,
@@ -1160,9 +1166,6 @@ class HQSession
         session_.pauseReads();
       };
     }
-
-    void onUnframedBodyStarted(HTTPCodec::StreamID streamID,
-                               uint64_t streamOffset) override;
 
     void onChunkHeader(HTTPCodec::StreamID /* stream */,
                        size_t length) override {
@@ -1265,7 +1268,7 @@ class HQSession
     }
 
     void onPriority(HTTPCodec::StreamID /* stream */,
-                    const HTTPMessage::HTTPPriority& /* priority */) override {
+                    const HTTPMessage::HTTP2Priority& /* priority */) override {
       VLOG(4) << __func__ << " txn=" << txn_;
     }
 
@@ -1327,12 +1330,9 @@ class HQSession
 
     size_t sendPriority(
         HTTPTransaction* /* txn */,
-        const http2::PriorityUpdate& /* pri */) noexcept override {
-      VLOG(4) << __func__ << " txn=" << txn_;
-      CHECK(hasEgressStreamId())
-          << __func__ << " invoked on stream without egress";
-      return 0;
-    }
+        const http2::PriorityUpdate& /* pri */) noexcept override;
+    size_t changePriority(HTTPTransaction* txn,
+                          HTTPPriority pri) noexcept override;
 
     size_t sendWindowUpdate(HTTPTransaction* /* txn */,
                             uint32_t /* bytes */) noexcept override {
@@ -1386,8 +1386,8 @@ class HQSession
       session_.describe(os);
     }
 
-    const wangle::TransportInfo& getSetupTransportInfo() const
-        noexcept override {
+    const wangle::TransportInfo& getSetupTransportInfo()
+        const noexcept override {
       VLOG(4) << __func__ << " txn=" << txn_;
       return session_.transportInfo_;
     }
@@ -1446,8 +1446,8 @@ class HQSession
     }
 
     void removeWaitingForReplaySafety(
-        folly::AsyncTransport::ReplaySafetyCallback*
-            callback) noexcept override {
+        folly::AsyncTransport::ReplaySafetyCallback* callback) noexcept
+        override {
       VLOG(4) << __func__ << " txn=" << txn_;
       session_.waitingForReplaySafety_.remove(callback);
     }
@@ -1457,8 +1457,8 @@ class HQSession
       return false;
     }
 
-    const folly::AsyncTransport* getUnderlyingTransport() const
-        noexcept override {
+    const folly::AsyncTransport* getUnderlyingTransport()
+        const noexcept override {
       VLOG(4) << __func__ << " txn=" << txn_;
       return nullptr;
     }
@@ -1473,16 +1473,16 @@ class HQSession
       return false;
     }
 
-    folly::Optional<const HTTPMessage::HTTPPriority> getHTTPPriority(
+    folly::Optional<const HTTPMessage::HTTP2Priority> getHTTPPriority(
         uint8_t /* pri */) override {
       VLOG(4) << __func__ << " txn=" << txn_;
-      return HTTPMessage::HTTPPriority(hqDefaultPriority.streamDependency,
-                                       hqDefaultPriority.exclusive,
-                                       hqDefaultPriority.weight);
+      return HTTPMessage::HTTP2Priority(hqDefaultPriority.streamDependency,
+                                        hqDefaultPriority.exclusive,
+                                        hqDefaultPriority.weight);
     }
 
-    folly::Optional<HTTPTransaction::ConnectionToken> getConnectionToken() const
-        noexcept override {
+    folly::Optional<HTTPTransaction::ConnectionToken> getConnectionToken()
+        const noexcept override {
       return session_.connectionToken_;
     }
 
@@ -1493,12 +1493,6 @@ class HQSession
         HTTPTransaction::PeekCallback peekCallback) override;
 
     folly::Expected<folly::Unit, ErrorCode> consume(size_t amount) override;
-
-    folly::Expected<folly::Optional<uint64_t>, ErrorCode> skipBodyTo(
-        HTTPTransaction* txn, uint64_t nextBodyOffset) override;
-
-    folly::Expected<folly::Optional<uint64_t>, ErrorCode> rejectBodyTo(
-        HTTPTransaction* txn, uint64_t nextBodyOffset) override;
 
     void trackEgressBodyDelivery(uint64_t bodyOffset) override;
 
@@ -1526,7 +1520,7 @@ class HQSession
         enqueued_ = handle->isEnqueued();
       }
 
-      HTTP2PriorityQueueBase::Handle getHandle() const {
+      HTTP2PriorityQueueBase::Handle FOLLY_NULLABLE getHandle() const {
         return egressQueueHandle_;
       }
 
@@ -1536,7 +1530,7 @@ class HQSession
 
       // HQStreamTransport is enqueued
       bool isStreamTransportEnqueued() const {
-        return egressQueueHandle_->isEnqueued();
+        return egressQueueHandle_ ? egressQueueHandle_->isEnqueued() : false;
       }
 
       bool isTransactionEnqueued() const {
@@ -1556,7 +1550,7 @@ class HQSession
       }
 
      private:
-      HTTP2PriorityQueueBase::Handle egressQueueHandle_;
+      HTTP2PriorityQueueBase::Handle egressQueueHandle_{nullptr};
       bool enqueued_;
     };
 
@@ -1576,6 +1570,7 @@ class HQSession
         http2::PriorityUpdate pri,
         uint64_t* depth) override {
       CHECK_EQ(handle, &queueHandle_);
+      CHECK(queueHandle_.getHandle());
       return session_.txnEgressQueue_.updatePriority(
           queueHandle_.getHandle(), pri, depth);
     }
@@ -1583,6 +1578,7 @@ class HQSession
     // Remove the transaction from the priority tree
     void removeTransaction(HTTP2PriorityQueueBase::Handle handle) override {
       CHECK_EQ(handle, &queueHandle_);
+      CHECK(queueHandle_.getHandle());
       session_.txnEgressQueue_.removeTransaction(queueHandle_.getHandle());
       queueHandle_.clearHandle();
     }
@@ -1718,7 +1714,7 @@ class HQSession
         quic::StreamId streamId,
         uint32_t seqNo,
         std::unique_ptr<HTTPCodec> codec,
-        const WheelTimerInstance& timeout,
+        const WheelTimerInstance& wheelTimer,
         HTTPSessionStats* stats = nullptr,
         http2::PriorityUpdate priority = hqDefaultPriority,
         folly::Optional<HTTPCodec::StreamID> parentTxnId = HTTPCodec::NoStream)
@@ -1727,7 +1723,7 @@ class HQSession
                                 direction,
                                 streamId,
                                 seqNo,
-                                timeout,
+                                wheelTimer,
                                 stats,
                                 priority,
                                 parentTxnId) {
@@ -1790,32 +1786,6 @@ class HQSession
     }
     virtual void setHeaderCodecStats(HeaderCodec::Stats*) {
     }
-    virtual bool isPartialReliabilityEnabled() const noexcept = 0;
-    virtual folly::Expected<uint64_t, hq::UnframedBodyOffsetTrackerError>
-    onIngressPeekDataAvailable(uint64_t /* streamOffset */) {
-      LOG(FATAL) << ": called in base class";
-      folly::assume_unreachable();
-    }
-    virtual folly::Expected<uint64_t, hq::UnframedBodyOffsetTrackerError>
-    onIngressDataExpired(uint64_t /* streamOffset */) {
-      LOG(FATAL) << ": called in base class";
-      folly::assume_unreachable();
-    }
-    virtual folly::Expected<uint64_t, hq::UnframedBodyOffsetTrackerError>
-    onIngressDataRejected(uint64_t /* streamOffset */) {
-      LOG(FATAL) << ": called in base class";
-      folly::assume_unreachable();
-    }
-    virtual folly::Expected<uint64_t, hq::UnframedBodyOffsetTrackerError>
-    onEgressBodySkip(uint64_t /* bodyOffset */) {
-      LOG(FATAL) << ": called in base class";
-      folly::assume_unreachable();
-    }
-    virtual folly::Expected<uint64_t, hq::UnframedBodyOffsetTrackerError>
-    onEgressBodyReject(uint64_t /* bodyOffset */) {
-      LOG(FATAL) << ": called in base class";
-      folly::assume_unreachable();
-    }
 
     HQSession& session_;
   };
@@ -1869,10 +1839,6 @@ class HQSession
     }
 
     void abortStream(quic::StreamId /*id*/) override {
-    }
-
-    bool isPartialReliabilityEnabled() const noexcept override {
-      return false;
     }
   };
 
@@ -1936,25 +1902,6 @@ class HQSession
       qpackCodec_.setStats(stats);
     }
 
-    bool isPartialReliabilityEnabled() const noexcept override {
-      return session_.sock_ && session_.sock_->isPartiallyReliableTransport();
-    }
-
-    folly::Expected<uint64_t, hq::UnframedBodyOffsetTrackerError>
-    onIngressPeekDataAvailable(uint64_t streamOffset) override;
-
-    folly::Expected<uint64_t, hq::UnframedBodyOffsetTrackerError>
-    onIngressDataExpired(uint64_t streamOffset) override;
-
-    folly::Expected<uint64_t, hq::UnframedBodyOffsetTrackerError>
-    onIngressDataRejected(uint64_t streamOffset) override;
-
-    folly::Expected<uint64_t, hq::UnframedBodyOffsetTrackerError>
-    onEgressBodySkip(uint64_t bodyOffset) override;
-
-    folly::Expected<uint64_t, hq::UnframedBodyOffsetTrackerError>
-    onEgressBodyReject(uint64_t bodyOffset) override;
-
    private:
     QPACKCodec qpackCodec_;
     hq::HQStreamCodec* hqStreamCodecPtr_{nullptr};
@@ -1999,10 +1946,6 @@ class HQSession
 
     void checkSendingGoaway(const HTTPMessage& /*msg*/) override {
     }
-
-    bool isPartialReliabilityEnabled() const noexcept override {
-      return false;
-    }
   };
 
   uint32_t getMaxConcurrentOutgoingStreamsRemote() const override {
@@ -2040,10 +1983,10 @@ class HQSession
       controlStreams_;
   HQUnidirStreamDispatcher unidirectionalReadDispatcher_;
 
-  // Maximum Stream ID received so far
-  quic::StreamId maxIncomingStreamId_{0};
+  // Min Stream ID we haven't seen so far
+  quic::StreamId minUnseenIncomingStreamId_{0};
   // Maximum Stream ID that we are allowed to open, according to the remote
-  quic::StreamId maxAllowedStreamId_{quic::kEightByteLimit};
+  quic::StreamId minPeerUnseenId_{hq::kMaxClientBidiStreamId};
   // Whether SETTINGS have been received
   bool receivedSettings_{false};
 
@@ -2075,6 +2018,7 @@ class HQSession
        hq::kDefaultEgressQpackBlockedStream},
   };
   HTTPSettings ingressSettings_;
+  uint64_t minUnseenIncomingPushId_{0};
 
   std::unique_ptr<VersionUtils> versionUtils_;
   ReadyGate versionUtilsReady_;
@@ -2092,6 +2036,10 @@ class HQSession
   // Creation time (for handshake time tracking)
   std::chrono::steady_clock::time_point createTime_;
 
+  // Lookup maps for matching PushIds to StreamIds
+  folly::F14FastMap<hq::PushId, quic::StreamId> pushIdToStreamId_;
+  // Lookup maps for matching ingress push streams to push ids
+  folly::F14FastMap<quic::StreamId, hq::PushId> streamIdToPushId_;
 }; // HQSession
 
 std::ostream& operator<<(std::ostream& os, HQSession::DrainState drainState);

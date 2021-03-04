@@ -134,16 +134,6 @@ class HTTPCodec {
                         uint16_t padding) = 0;
 
     /**
-     * Called when DATA frame with length 0 headers arrives.
-     *
-     * @param stream        The stream ID
-     * @param streamOffset  Stream offset at which the body starts.
-     */
-    virtual void onUnframedBodyStarted(StreamID /* stream */,
-                                       uint64_t /* streamOffset */) {
-    }
-
-    /**
      * Called for each HTTP chunk header.
      *
      * onChunkHeader() will be called when the chunk header is received.  As
@@ -281,7 +271,21 @@ class HTTPCodec {
      * dynamic priority
      */
     virtual void onPriority(StreamID /* stream */,
-                            const HTTPMessage::HTTPPriority& /* pri */) {
+                            const HTTPMessage::HTTP2Priority& /* pri */) {
+    }
+
+    /**
+     * Experimental: this is the new HTTP Priority draft format of priority
+     * update. This is called when a PRIORITY_UPDATE frame is received.
+     */
+    virtual void onPriority(StreamID, const HTTPPriority& /* pri */) {
+    }
+
+    /**
+     * Experimental: this is the new HTTP Priority draft format of priority
+     * update. This is called when a PUSH_PRIORITY_UPDATE frame is received.
+     */
+    virtual void onPushPriority(StreamID, const HTTPPriority& /* pri */) {
     }
 
     /**
@@ -505,15 +509,19 @@ class HTTPCodec {
   /**
    * Write an egress message header.  For pushed streams, you must specify
    * the assocStream.
+   * @param extraHeaders Optional extra headers to be generated togetger with
+   *                     the msg.
    * @retval size the size of the generated message, both the actual size
    *              and the size of the uncompressed data.
    * @return None
    */
-  virtual void generateHeader(folly::IOBufQueue& writeBuf,
-                              StreamID stream,
-                              const HTTPMessage& msg,
-                              bool eom = false,
-                              HTTPHeaderSize* size = nullptr) = 0;
+  virtual void generateHeader(
+      folly::IOBufQueue& writeBuf,
+      StreamID stream,
+      const HTTPMessage& msg,
+      bool eom = false,
+      HTTPHeaderSize* size = nullptr,
+      folly::Optional<HTTPHeaders> extraHeaders = folly::none) = 0;
 
   virtual void generatePushPromise(folly::IOBufQueue& /* writeBuf */,
                                    StreamID /* stream */,
@@ -662,7 +670,27 @@ class HTTPCodec {
    */
   virtual size_t generatePriority(folly::IOBufQueue& /* writeBuf */,
                                   StreamID /* stream */,
-                                  const HTTPMessage::HTTPPriority& /* pri */) {
+                                  const HTTPMessage::HTTP2Priority& /* pri */) {
+    return 0;
+  }
+
+  /**
+   * Generate a PRIORITY_UPDATE frame, according to the new HTTP priority
+   * draft, if supported.
+   */
+  virtual size_t generatePriority(folly::IOBufQueue& /* writeBuf */,
+                                  StreamID /* stream */,
+                                  HTTPPriority /* priority */) {
+    return 0;
+  }
+
+  /**
+   * Generate a PUSH_PRIORITY_UPDATE frame for non push stream, according to
+   * the new HTTP priority draft, if supported.
+   */
+  virtual size_t generatePushPriority(folly::IOBufQueue& /* writeBuf */,
+                                      StreamID /* stream */,
+                                      HTTPPriority /* priority */) {
     return 0;
   }
 

@@ -7,6 +7,7 @@
  */
 
 #include <proxygen/lib/http/codec/HTTP2Codec.h>
+
 #include <proxygen/lib/http/codec/CodecUtil.h>
 #include <proxygen/lib/http/codec/HTTP2Constants.h>
 #include <proxygen/lib/utils/Base64.h>
@@ -34,7 +35,8 @@ std::string base64url_decode(const std::string& str) {
 }
 
 const size_t kDefaultGrowth = 4000;
-
+constexpr auto kOkhttp2 = "okhttp/2";
+constexpr int kOkhttp2GoawayLogFreq = 1000;
 } // namespace
 
 namespace proxygen {
@@ -718,8 +720,13 @@ ErrorCode HTTP2Codec::parsePriority(Cursor& cursor) {
         false);
     return ErrorCode::NO_ERROR;
   }
+  // Now we have two onPriority overloads, this function pointer has to be
+  // explicitly specified via a cast:
+  auto onPriFunc = static_cast<void (HTTPCodec::Callback::*)(
+      StreamID, const HTTPMessage::HTTP2Priority&)>(
+      &HTTPCodec::Callback::onPriority);
   deliverCallbackIfAllowed(
-      &HTTPCodec::Callback::onPriority,
+      onPriFunc,
       "onPriority",
       curHeader_.stream,
       std::make_tuple(pri.streamDependency, pri.exclusive, pri.weight));
@@ -757,7 +764,10 @@ ErrorCode HTTP2Codec::parseRstStream(Cursor& cursor) {
                           curHeader_.stream,
                           " user-agent=",
                           userAgent_);
-    VLOG(2) << goawayErrorMessage_;
+    int logFreq = userAgent_.find(kOkhttp2) == std::string::npos
+                      ? 1
+                      : kOkhttp2GoawayLogFreq;
+    VLOG_EVERY_N(2, logFreq) << goawayErrorMessage_;
   }
   deliverCallbackIfAllowed(
       &HTTPCodec::Callback::onAbort, "onAbort", curHeader_.stream, statusCode);
@@ -1146,14 +1156,16 @@ void HTTP2Codec::generateHeader(folly::IOBufQueue& writeBuf,
                                 StreamID stream,
                                 const HTTPMessage& msg,
                                 bool eom,
-                                HTTPHeaderSize* size) {
+                                HTTPHeaderSize* size,
+                                folly::Optional<HTTPHeaders> extraHeaders) {
   generateHeaderImpl(writeBuf,
                      stream,
                      msg,
                      folly::none, /* assocStream */
                      folly::none, /* controlStream */
                      eom,
-                     size);
+                     size,
+                     std::move(extraHeaders));
 }
 
 void HTTP2Codec::generatePushPromise(folly::IOBufQueue& writeBuf,
@@ -1168,7 +1180,8 @@ void HTTP2Codec::generatePushPromise(folly::IOBufQueue& writeBuf,
                      assocStream,
                      folly::none, /* controlStream */
                      eom,
-                     size);
+                     size,
+                     folly::none /* extraHeaders */);
 }
 
 void HTTP2Codec::generateExHeader(folly::IOBufQueue& writeBuf,
@@ -1183,7 +1196,8 @@ void HTTP2Codec::generateExHeader(folly::IOBufQueue& writeBuf,
                      folly::none, /* assocStream */
                      exAttributes,
                      eom,
-                     size);
+                     size,
+                     folly::none /* extraHeaders */);
 }
 
 size_t HTTP2Codec::splitCompressed(size_t compressed,
@@ -1210,7 +1224,8 @@ void HTTP2Codec::generateHeaderImpl(
     const folly::Optional<StreamID>& assocStream,
     const folly::Optional<HTTPCodec::ExAttributes>& exAttributes,
     bool eom,
-    HTTPHeaderSize* size) {
+    HTTPHeaderSize* size,
+    folly::Optional<HTTPHeaders> extraHeaders) {
   HTTPHeaderSize localSize;
   if (!size) {
     size = &localSize;
@@ -1267,7 +1282,8 @@ void HTTP2Codec::generateHeaderImpl(
       maxFrameSize - headerSize + http2::kFrameHeaderSize;
   auto frameHeader = writeBuf.preallocate(headerSize, kDefaultGrowth);
   writeBuf.postallocate(headerSize);
-  headerCodec_.encodeHTTP(msg, writeBuf, addDateToResponse_);
+  headerCodec_.encodeHTTP(
+      msg, writeBuf, addDateToResponse_, std::move(extraHeaders));
   *size = headerCodec_.getEncodedSize();
 
   IOBufQueue queue(IOBufQueue::cacheChainLength());
@@ -1701,7 +1717,7 @@ size_t HTTP2Codec::generateWindowUpdate(folly::IOBufQueue& writeBuf,
 
 size_t HTTP2Codec::generatePriority(folly::IOBufQueue& writeBuf,
                                     StreamID stream,
-                                    const HTTPMessage::HTTPPriority& pri) {
+                                    const HTTPMessage::HTTP2Priority& pri) {
   VLOG(4) << "generating priority for stream=" << stream;
   if (!isStreamIngressEgressAllowed(stream)) {
     VLOG(2) << "suppressed PRIORITY for stream=" << stream
@@ -1715,6 +1731,12 @@ size_t HTTP2Codec::generatePriority(folly::IOBufQueue& writeBuf,
           writeBuf,
           stream,
           {std::get<0>(pri), std::get<1>(pri), std::get<2>(pri)}));
+}
+
+size_t HTTP2Codec::generatePriority(folly::IOBufQueue& /* writeBuf */,
+                                    StreamID /* stream */,
+                                    HTTPPriority /* priority */) {
+  return 0;
 }
 
 size_t HTTP2Codec::generateCertificateRequest(

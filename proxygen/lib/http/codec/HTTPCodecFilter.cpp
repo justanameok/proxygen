@@ -40,11 +40,6 @@ void PassThroughHTTPCodecFilter::onBody(StreamID stream,
   callback_->onBody(stream, std::move(chain), padding);
 }
 
-void PassThroughHTTPCodecFilter::onUnframedBodyStarted(StreamID stream,
-                                                       uint64_t streamOffset) {
-  callback_->onUnframedBodyStarted(stream, streamOffset);
-}
-
 void PassThroughHTTPCodecFilter::onChunkHeader(StreamID stream, size_t length) {
   callback_->onChunkHeader(stream, length);
 }
@@ -110,8 +105,18 @@ void PassThroughHTTPCodecFilter::onSettingsAck() {
 }
 
 void PassThroughHTTPCodecFilter::onPriority(
-    StreamID stream, const HTTPMessage::HTTPPriority& pri) {
+    StreamID stream, const HTTPMessage::HTTP2Priority& pri) {
   callback_->onPriority(stream, pri);
+}
+
+void PassThroughHTTPCodecFilter::onPriority(StreamID stream,
+                                            const HTTPPriority& pri) {
+  callback_->onPriority(stream, pri);
+}
+
+void PassThroughHTTPCodecFilter::onPushPriority(StreamID stream,
+                                                const HTTPPriority& pri) {
+  callback_->onPushPriority(stream, pri);
 }
 
 bool PassThroughHTTPCodecFilter::onNativeProtocolUpgrade(
@@ -227,12 +232,15 @@ size_t PassThroughHTTPCodecFilter::generateConnectionPreface(
   return call_->generateConnectionPreface(writeBuf);
 }
 
-void PassThroughHTTPCodecFilter::generateHeader(folly::IOBufQueue& writeBuf,
-                                                StreamID stream,
-                                                const HTTPMessage& msg,
-                                                bool eom,
-                                                HTTPHeaderSize* size) {
-  return call_->generateHeader(writeBuf, stream, msg, eom, size);
+void PassThroughHTTPCodecFilter::generateHeader(
+    folly::IOBufQueue& writeBuf,
+    StreamID stream,
+    const HTTPMessage& msg,
+    bool eom,
+    HTTPHeaderSize* size,
+    folly::Optional<HTTPHeaders> extraHeaders) {
+  return call_->generateHeader(
+      writeBuf, stream, msg, eom, size, std::move(extraHeaders));
 }
 
 void PassThroughHTTPCodecFilter::generatePushPromise(folly::IOBufQueue& buf,
@@ -325,8 +333,19 @@ size_t PassThroughHTTPCodecFilter::generateWindowUpdate(folly::IOBufQueue& buf,
 size_t PassThroughHTTPCodecFilter::generatePriority(
     folly::IOBufQueue& writeBuf,
     StreamID stream,
-    const HTTPMessage::HTTPPriority& pri) {
+    const HTTPMessage::HTTP2Priority& pri) {
   return call_->generatePriority(writeBuf, stream, pri);
+}
+
+size_t PassThroughHTTPCodecFilter::generatePriority(folly::IOBufQueue& writeBuf,
+                                                    StreamID streamId,
+                                                    HTTPPriority priority) {
+  return call_->generatePriority(writeBuf, streamId, priority);
+}
+
+size_t PassThroughHTTPCodecFilter::generatePushPriority(
+    folly::IOBufQueue& writeBuf, StreamID pushId, HTTPPriority priority) {
+  return call_->generatePriority(writeBuf, pushId, priority);
 }
 
 size_t PassThroughHTTPCodecFilter::generateCertificateRequest(

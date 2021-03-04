@@ -101,6 +101,9 @@ HQDownstreamSession::createEgressPushStream(hq::PushId pushId,
           WheelTimerInstance(transactionsTimeout_, getEventBase())));
   incrementSeqNo();
 
+  pushIdToStreamId_[pushId] = streamId;
+  streamIdToPushId_[streamId] = pushId;
+
   CHECK(matchPair.second) << "Emplacement failed, despite earlier "
                              "existence check.";
 
@@ -191,6 +194,12 @@ HQDownstreamSession::findEgressPushStream(quic::StreamId streamId) {
 }
 
 bool HQDownstreamSession::erasePushStream(quic::StreamId streamId) {
+  auto pushIdIter = streamIdToPushId_.find(streamId);
+  if (pushIdIter != streamIdToPushId_.end()) {
+    auto pushId = pushIdIter->second;
+    pushIdToStreamId_.erase(pushId);
+    streamIdToPushId_.erase(pushIdIter);
+  }
   return egressPushStreams_.erase(streamId);
 }
 
@@ -236,23 +245,36 @@ void HQDownstreamSession::HQEgressPushStream::sendPushPromise(
 
 size_t HQDownstreamSession::HQEgressPushStream::generateStreamPushId() {
   // reserve space for max quic interger len
-  folly::io::QueueAppender appender(&writeBuf_, 8);
-
-  auto externalPushId = pushId_ & ~hq::kPushIdMask;
-  auto result = quic::encodeQuicInteger(
-      externalPushId, [appender = std::move(appender)](auto val) mutable {
-        appender.writeBE(val);
-      });
+  auto result = hq::writeStreamPreface(writeBuf_, pushId_);
   CHECK(!result.hasError())
-      << __func__ << " QUIC integer encoding error value=" << externalPushId;
+      << __func__ << " QUIC integer encoding error value=" << pushId_;
 
   return *result;
 }
 
 // Return a new push id that can be used for outgoing transactions
 hq::PushId HQDownstreamSession::createNewPushId() {
-  auto newPushId = nextAvailablePushId_++ | hq::kPushIdMask;
+  auto newPushId = nextAvailablePushId_++;
   return newPushId;
+}
+
+folly::Optional<HTTPHeaders> HQDownstreamSession::getExtraHeaders(
+    const HTTPMessage& headers, quic::StreamId streamId) {
+  if (!sock_) {
+    return folly::none;
+  }
+  if (headers.getHeaders().exists(HTTP_HEADER_PRIORITY)) {
+    return folly::none;
+  }
+  auto priority = sock_->getStreamPriority(streamId);
+  if (!priority) {
+    return folly::none;
+  }
+  HTTPHeaders extraHeaders;
+  extraHeaders.add(
+      HTTP_HEADER_PRIORITY,
+      httpPriorityToString(priority->level, priority->incremental));
+  return extraHeaders;
 }
 
 } // namespace proxygen

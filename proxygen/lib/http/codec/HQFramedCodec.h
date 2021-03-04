@@ -102,7 +102,8 @@ class HQFramedCodec : public HTTPCodec {
                       StreamID /*stream*/,
                       const HTTPMessage& /*msg*/,
                       bool /*eom = false*/,
-                      HTTPHeaderSize* /*size = nullptr*/) override {
+                      HTTPHeaderSize* /*size = nullptr*/,
+                      folly::Optional<HTTPHeaders>) override {
     LOG(FATAL) << __func__ << " must be implemented in child class";
     folly::assume_unreachable();
   }
@@ -153,7 +154,6 @@ class HQFramedCodec : public HTTPCodec {
     folly::assume_unreachable();
   }
 
-  // HQ has no trailers
   size_t generateTrailers(folly::IOBufQueue& /*writeBuf*/,
                           StreamID /*stream*/,
                           const HTTPHeaders& /*trailers*/) override {
@@ -224,7 +224,7 @@ class HQFramedCodec : public HTTPCodec {
   // only valid for the Control Codec
   size_t generatePriority(folly::IOBufQueue& /*writeBuf*/,
                           StreamID /*stream*/,
-                          const HTTPMessage::HTTPPriority& /*pri*/) override {
+                          const HTTPMessage::HTTP2Priority& /*pri*/) override {
     LOG(FATAL) << __func__ << " not supported on this codec";
     folly::assume_unreachable();
   }
@@ -336,6 +336,18 @@ class HQFramedCodec : public HTTPCodec {
     folly::assume_unreachable();
   }
 
+  virtual ParseResult parsePushPriorityUpdate(folly::io::Cursor&,
+                                              const FrameHeader&) {
+    LOG(FATAL) << __func__ << " not supported on this codec";
+    folly::assume_unreachable();
+  }
+
+  virtual ParseResult parsePriorityUpdate(folly::io::Cursor&,
+                                          const FrameHeader&) {
+    LOG(FATAL) << __func__ << " not supported on this codec";
+    folly::assume_unreachable();
+  }
+
   virtual ParseResult parsePartiallyReliableData(
       folly::io::Cursor& /* cursor */) {
     LOG(FATAL) << __func__ << " not supported on this codec";
@@ -355,6 +367,8 @@ class HQFramedCodec : public HTTPCodec {
   virtual bool transportSupportsPartialReliability() const {
     return false;
   }
+
+  bool onFramedIngressEOF();
 
   HTTPCodec::StreamID streamId_;
   TransportDirection transportDirection_;

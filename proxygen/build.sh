@@ -58,7 +58,6 @@ function install_dependencies_linux() {
     zlib1g-dev \
     binutils-dev \
     libsodium-dev \
-    libzstd-dev \
     libdouble-conversion-dev
 }
 
@@ -77,8 +76,7 @@ function install_dependencies_mac() {
     snappy                   \
     xz                       \
     openssl                  \
-    libsodium                \
-    zstd
+    libsodium
 
   brew link                 \
     cmake                   \
@@ -92,8 +90,7 @@ function install_dependencies_mac() {
     snappy                  \
     openssl                 \
     xz                      \
-    libsodium               \
-    zstd
+    libsodium
 }
 
 function install_dependencies() {
@@ -112,6 +109,9 @@ function synch_dependency_to_commit() {
   # Utility function to synch a dependency to a specific commit. Takes two arguments:
   #   - $1: folder of the dependency's git repository
   #   - $2: path to the text file containing the desired commit hash
+  if [ "$FETCH_DEPENDENCIES" = false ] ; then
+    return
+  fi
   DEP_REV=$(sed 's/Subproject commit //' "$2")
   pushd "$1"
   git fetch
@@ -172,6 +172,30 @@ function setup_googletest() {
   make -j "$JOBS"
   make install
   echo -e "${COLOR_GREEN}googletest is installed ${COLOR_OFF}"
+  cd "$BWD" || exit
+}
+
+function setup_zstd() {
+  ZSTD_DIR=$DEPS_DIR/zstd
+  ZSTD_BUILD_DIR=$DEPS_DIR/zstd/build/cmake/builddir
+  ZSTD_INSTALL_DIR=$DEPS_DIR
+  if [ ! -d "$ZSTD_DIR" ] ; then
+    echo -e "${COLOR_GREEN}[ INFO ] Cloning zstd repo ${COLOR_OFF}"
+    git clone https://github.com/facebook/zstd.git "$ZSTD_DIR"
+  fi
+
+  echo -e "${COLOR_GREEN}Building Zstd ${COLOR_OFF}"
+  mkdir -p "$ZSTD_BUILD_DIR"
+  cd "$ZSTD_BUILD_DIR" || exit
+  cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo           \
+    -DBUILD_TESTS=OFF                               \
+    -DCMAKE_PREFIX_PATH="$ZSTD_INSTALL_DIR"         \
+    -DCMAKE_INSTALL_PREFIX="$ZSTD_INSTALL_DIR"      \
+    ${CMAKE_EXTRA_ARGS[@]+"${CMAKE_EXTRA_ARGS[@]}"} \
+    ..
+  make -j "$JOBS"
+  make install
+  echo -e "${COLOR_GREEN}Zstd is installed ${COLOR_OFF}"
   cd "$BWD" || exit
 }
 
@@ -335,9 +359,10 @@ function setup_mvfst() {
 JOBS=8
 WITH_QUIC=false
 INSTALL_DEPENDENCIES=true
+FETCH_DEPENDENCIES=true
 PREFIX=""
 COMPILER_FLAGS=""
-USAGE="./build.sh [-j num_jobs] [-q|--with-quic] [-m|--no-jemalloc] [--no-install-dependencies] [-p|--prefix] [-x|--compiler-flags]"
+USAGE="./build.sh [-j num_jobs] [-q|--with-quic] [-m|--no-jemalloc] [--no-install-dependencies] [-p|--prefix] [-x|--compiler-flags] [--no-fetch-dependencies]"
 while [ "$1" != "" ]; do
   case $1 in
     -j | --jobs ) shift
@@ -351,6 +376,9 @@ while [ "$1" != "" ]; do
                   ;;
     --no-install-dependencies )
                   INSTALL_DEPENDENCIES=false
+          ;;
+    --no-fetch-dependencies )
+                  FETCH_DEPENDENCIES=false
           ;;
     --build-for-fuzzing )
                   BUILD_FOR_FUZZING=true
@@ -398,6 +426,7 @@ cd "$(dirname "$0")"
 
 setup_fmt
 setup_googletest
+setup_zstd
 setup_folly
 setup_fizz
 setup_wangle

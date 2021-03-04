@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <folly/Expected.h>
 #include <proxygen/lib/http/session/HTTPTransaction.h>
 
 namespace proxygen {
@@ -74,7 +75,7 @@ class ResponseHandler {
 
   virtual void resumeIngress() noexcept = 0;
 
-  virtual ResponseHandler* newPushedResponse(
+  virtual folly::Expected<ResponseHandler*, ProxygenError> newPushedResponse(
       PushHandler* pushHandler) noexcept = 0;
 
   virtual ResponseHandler* newExMessage(
@@ -85,8 +86,8 @@ class ResponseHandler {
   }
 
   // Accessors for Transport/Connection information
-  virtual const wangle::TransportInfo& getSetupTransportInfo() const
-      noexcept = 0;
+  virtual const wangle::TransportInfo& getSetupTransportInfo()
+      const noexcept = 0;
 
   virtual void getCurrentTransportInfo(wangle::TransportInfo* tinfo) const = 0;
 

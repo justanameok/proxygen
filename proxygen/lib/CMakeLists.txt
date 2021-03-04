@@ -62,7 +62,6 @@ if (BUILD_QUIC)
         HTTP3_SOURCES
         ${HTTP3_SOURCES}
         http/SynchronizedLruQuicPskCache.cpp
-        http/HTTP3ErrorCode.cpp
         http/HQConnector.cpp
         http/codec/HQControlCodec.cpp
         http/codec/HQFramedCodec.cpp
@@ -70,7 +69,6 @@ if (BUILD_QUIC)
         http/codec/HQStreamCodec.cpp
         http/codec/HQUnidirectionalCodec.cpp
         http/codec/HQUtils.cpp
-        http/codec/UnframedBodyOffsetTracker.cpp
         http/session/HQByteEventTracker.cpp
         http/session/HQDownstreamSession.cpp
         http/session/HQSession.cpp
@@ -92,8 +90,9 @@ if (BUILD_QUIC)
 endif()
 
 add_library(
-    proxygen STATIC
+    proxygen
     healthcheck/ServerHealthCheckerCallback.cpp
+    http/HTTP3ErrorCode.cpp
     http/codec/CodecProtocol.cpp
     http/codec/CodecUtil.cpp
     http/codec/compress/GzipHeaderCodec.cpp
@@ -149,6 +148,7 @@ add_library(
     http/HTTPMessage.cpp
     http/HTTPMessageFilters.cpp
     http/HTTPMethod.cpp
+    http/HTTPPriorityFunctions.cpp
     http/StatusTypeEnum.cpp
     http/ProxygenErrorEnum.cpp
     http/ProxyStatus.cpp
@@ -221,6 +221,13 @@ target_compile_options(
     ${_PROXYGEN_COMMON_COMPILE_OPTIONS}
 )
 
+if (BUILD_SHARED_LIBS)
+    set_property(TARGET proxygen PROPERTY POSITION_INDEPENDENT_CODE ON)
+    if (DEFINED PACKAGE_VERSION)
+      set_target_properties(proxygen PROPERTIES VERSION ${PACKAGE_VERSION})
+    endif()
+endif()
+
 target_link_libraries(
     proxygen PUBLIC
     Folly::folly
@@ -229,6 +236,7 @@ target_link_libraries(
     zstd
     Boost::boost
     Boost::iostreams
+    -lz
     ${HTTP3_DEPEND_LIBS}
 )
 
@@ -257,7 +265,7 @@ install(
 install(
     TARGETS proxygen
     EXPORT proxygen-exports
-    DESTINATION lib
+    DESTINATION ${LIB_INSTALL_DIR}
 )
 
 add_subdirectory(test)

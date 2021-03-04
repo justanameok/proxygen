@@ -38,6 +38,9 @@ ParseResult HQFramedCodec::parseFrame(Cursor& cursor) {
       return parseGoaway(cursor, curHeader_);
     case hq::FrameType::MAX_PUSH_ID:
       return parseMaxPushId(cursor, curHeader_);
+    case hq::FrameType::PRIORITY_UPDATE:
+    case hq::FrameType::PUSH_PRIORITY_UPDATE:
+      return parsePriorityUpdate(cursor, curHeader_);
     default:
       // Implementations MUST ignore and discard any frame that has a
       // type that is unknown
@@ -152,16 +155,37 @@ size_t HQFramedCodec::onFramedIngress(const IOBuf& buf) {
   return parsedTot;
 }
 
+bool HQFramedCodec::onFramedIngressEOF() {
+  if (connError_ != folly::none) {
+    return false;
+  } else if (parserPaused_) {
+    deferredEOF_ = true;
+    return false;
+  } else if (frameState_ != FrameState::FRAME_HEADER_TYPE &&
+             (!transportSupportsPartialReliability() ||
+              frameState_ !=
+                  FrameState::FRAME_PAYLOAD_PARTIALLY_RELIABLE_STREAMING)) {
+    VLOG(3) << "Stream ended in the middle of a frame type=" << curHeader_.type;
+    connError_ = HTTP3::ErrorCode::HTTP_FRAME_ERROR;
+    checkConnectionError(connError_, nullptr);
+    return false;
+  }
+  // Caller will fire onMessageComplete
+  return true;
+}
+
 bool HQFramedCodec::checkConnectionError(ParseResult err,
                                          const folly::IOBuf* buf) {
   if (err != folly::none) {
     LOG(ERROR) << "Connection error with ingress=";
-    VLOG(3) << IOBufPrinter::printHexFolly(buf, true);
+    if (buf) {
+      VLOG(3) << IOBufPrinter::printHexFolly(buf, true);
+    }
     setParserPaused(true);
     if (callback_) {
       HTTPException ex(HTTPException::Direction::INGRESS_AND_EGRESS,
                        "Connection error");
-      ex.setErrno(uint32_t(err.value()));
+      ex.setHttp3ErrorCode(err.value());
       callback_->onError(kSessionStreamId, ex, false);
     }
     return true;

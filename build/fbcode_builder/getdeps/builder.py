@@ -263,6 +263,56 @@ class Iproute2Builder(BuilderBase):
         self._run_cmd(install_cmd, env=env)
 
 
+class BistroBuilder(BuilderBase):
+    def _build(self, install_dirs, reconfigure):
+        p = os.path.join(self.src_dir, "bistro", "bistro")
+        env = self._compute_env(install_dirs)
+        env["PATH"] = env["PATH"] + ":" + os.path.join(p, "bin")
+        env["TEMPLATES_PATH"] = os.path.join(p, "include", "thrift", "templates")
+        self._run_cmd(
+            [
+                os.path.join(".", "cmake", "run-cmake.sh"),
+                "Release",
+                "-DCMAKE_INSTALL_PREFIX=" + self.inst_dir,
+            ],
+            cwd=p,
+            env=env,
+        )
+        self._run_cmd(
+            [
+                "make",
+                "install",
+                "-j",
+                str(self.build_opts.num_jobs),
+            ],
+            cwd=os.path.join(p, "cmake", "Release"),
+            env=env,
+        )
+
+    def run_tests(
+        self, install_dirs, schedule_type, owner, test_filter, retry, no_testpilot
+    ):
+        env = self._compute_env(install_dirs)
+        build_dir = os.path.join(self.src_dir, "bistro", "bistro", "cmake", "Release")
+        NUM_RETRIES = 5
+        for i in range(NUM_RETRIES):
+            cmd = ["ctest", "--output-on-failure"]
+            if i > 0:
+                cmd.append("--rerun-failed")
+            cmd.append(build_dir)
+            try:
+                self._run_cmd(
+                    cmd,
+                    cwd=build_dir,
+                    env=env,
+                )
+            except Exception:
+                print(f"Tests failed... retrying ({i+1}/{NUM_RETRIES})")
+            else:
+                return
+        raise Exception(f"Tests failed even after {NUM_RETRIES} retries")
+
+
 class CMakeBuilder(BuilderBase):
     MANUAL_BUILD_SCRIPT = """\
 #!{sys.executable}
@@ -288,9 +338,7 @@ def get_jobs_argument(num_jobs_arg: int) -> str:
         return "-j" + str(num_jobs_arg)
 
     import multiprocessing
-    num_jobs = multiprocessing.cpu_count()
-    if sys.platform == "win32":
-        num_jobs //= 2
+    num_jobs = multiprocessing.cpu_count() // 2
     return "-j" + str(num_jobs)
 
 
@@ -389,6 +437,7 @@ if __name__ == "__main__":
         inst_dir,
         defines,
         final_install_prefix=None,
+        extra_cmake_defines=None,
     ):
         super(CMakeBuilder, self).__init__(
             build_opts,
@@ -400,6 +449,8 @@ if __name__ == "__main__":
             final_install_prefix=final_install_prefix,
         )
         self.defines = defines or {}
+        if extra_cmake_defines:
+            self.defines.update(extra_cmake_defines)
 
     def _invalidate_cache(self):
         for name in [
@@ -1281,7 +1332,13 @@ incremental = false
                     continue  # filter out commented lines and ones without git deps
                 for name, conf in dep_to_git.items():
                     if 'git = "{}"'.format(conf["repo_url"]) in line:
-                        crate_name, _, _ = line.partition("=")
+                        pkg_template = ' package = "'
+                        if pkg_template in line:
+                            crate_name, _, _ = line.partition(pkg_template)[
+                                2
+                            ].partition('"')
+                        else:
+                            crate_name, _, _ = line.partition("=")
                         deps_to_crates.setdefault(name, set()).add(crate_name.strip())
         return deps_to_crates
 

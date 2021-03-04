@@ -7,6 +7,7 @@
  */
 
 #include <proxygen/httpserver/HTTPServer.h>
+
 #include <boost/thread.hpp>
 #include <folly/FileUtil.h>
 #include <folly/experimental/TestUtil.h>
@@ -176,7 +177,7 @@ class Cb : public folly::AsyncSocket::ConnectCallback {
   void connectSuccess() noexcept override {
     success = true;
     reusedSession = sock_->getSSLSessionReused();
-    session = sock_->getSSLSessionV2();
+    session = sock_->getSSLSession();
     if (sock_->getPeerCertificate()) {
       // keeps this alive until Cb is destroyed, even if sock is closed
       auto cert = sock_->getPeerCertificate();
@@ -399,7 +400,7 @@ TEST(SSL, TestResumptionWithTickets) {
   ASSERT_FALSE(cb.reusedSession);
 
   folly::AsyncSSLSocket::UniquePtr sock2(new folly::AsyncSSLSocket(ctx, &evb));
-  sock2->setSSLSessionV2(cb.session);
+  sock2->setSSLSession(cb.session);
   Cb cb2(sock2.get());
   sock2->connect(&cb2, server->addresses().front().address, 1000);
   evb.loop();
@@ -430,7 +431,7 @@ TEST(SSL, TestResumptionAfterUpdateFails) {
   server->updateTicketSeeds(newSeeds);
 
   folly::AsyncSSLSocket::UniquePtr sock2(new folly::AsyncSSLSocket(ctx, &evb));
-  sock2->setSSLSessionV2(cb.session);
+  sock2->setSSLSession(cb.session);
   Cb cb2(sock2.get());
   sock2->connect(&cb2, server->addresses().front().address, 1000);
   evb.loop();
@@ -439,7 +440,7 @@ TEST(SSL, TestResumptionAfterUpdateFails) {
   ASSERT_FALSE(cb2.reusedSession);
 
   folly::AsyncSSLSocket::UniquePtr sock3(new folly::AsyncSSLSocket(ctx, &evb));
-  sock3->setSSLSessionV2(cb2.session);
+  sock3->setSSLSession(cb2.session);
   Cb cb3(sock3.get());
   sock3->connect(&cb3, server->addresses().front().address, 1000);
   evb.loop();
@@ -796,7 +797,8 @@ TEST_F(ConnectionFilterTest, Test) {
       kTestDir + "certs/test_cert1.pem", kTestDir + "certs/test_key1.pem", "");
   sslCfg.clientCAFile = kTestDir + "certs/client_ca_cert.pem";
   // Permissive client auth.
-  sslCfg.clientVerification = folly::SSLContext::SSLVerifyPeerEnum::VERIFY;
+  sslCfg.clientVerification =
+      folly::SSLContext::VerifyClientCertificate::IF_PRESENTED;
   cfg_.sslConfigs.push_back(sslCfg);
 
   auto server = createScopedServer();

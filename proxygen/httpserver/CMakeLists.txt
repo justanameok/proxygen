@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 add_library(
-    proxygenhttpserver STATIC
+    proxygenhttpserver
     RequestHandlerAdaptor.cpp
     SignalHandler.cpp
     HTTPServerAcceptor.cpp
@@ -16,6 +16,13 @@ target_compile_options(
     PRIVATE
         ${_PROXYGEN_COMMON_COMPILE_OPTIONS}
 )
+if (BUILD_SHARED_LIBS)
+    set_property(TARGET proxygenhttpserver PROPERTY POSITION_INDEPENDENT_CODE ON)
+    if (DEFINED PACKAGE_VERSION)
+        set_target_properties(proxygenhttpserver PROPERTIES VERSION ${PACKAGE_VERSION})
+    endif()
+endif()
+
 target_link_libraries(
     proxygenhttpserver
     PUBLIC
@@ -24,7 +31,7 @@ target_link_libraries(
 install(
     TARGETS proxygenhttpserver
     EXPORT proxygen-exports
-    DESTINATION lib
+    DESTINATION ${LIB_INSTALL_DIR}
 )
 
 add_executable(proxygen_push
@@ -120,7 +127,6 @@ if (BUILD_QUIC)
       samples/hq/HQServer.cpp
       samples/hq/HQParams.cpp
       samples/hq/SampleHandlers.cpp
-      samples/hq/PartiallyReliableCurlClient.cpp
   )
   target_compile_options(
       hq

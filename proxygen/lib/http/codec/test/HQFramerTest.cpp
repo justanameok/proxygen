@@ -7,6 +7,7 @@
  */
 
 #include <proxygen/lib/http/codec/test/HQFramerTest.h>
+
 #include <folly/portability/GTest.h>
 #include <proxygen/lib/http/HTTP3ErrorCode.h>
 #include <proxygen/lib/http/codec/HQFramer.h>
@@ -20,6 +21,27 @@ using namespace proxygen::hq;
 using namespace proxygen;
 using namespace std;
 using namespace testing;
+
+namespace {
+// Return true if (lhs < rhs), false otherwise
+bool comparePushId(PushId lhs, PushId rhs) {
+  return (lhs < rhs) ? false : true;
+}
+
+// Validate the given push ID.
+bool isValidPushId(folly::Optional<PushId> maxAllowedPushId, PushId pushId) {
+  if (!maxAllowedPushId.hasValue()) {
+    VLOG(3) << __func__ << "maximum push ID value has not been set";
+    return false;
+  } else if (!comparePushId(maxAllowedPushId.value(), pushId)) {
+    VLOG(3) << __func__ << "given pushid=" << pushId
+            << "exceeds possible push ID value "
+            << "maxAllowedPushId_=" << maxAllowedPushId.value();
+    return false;
+  }
+  return true;
+}
+} // namespace
 
 template <class T>
 class HQFramerTestFixture : public T {
@@ -68,9 +90,9 @@ class HQFramerTestFixture : public T {
 class HQFramerTest : public HQFramerTestFixture<testing::Test> {};
 
 TEST_F(HQFramerTest, TestValidPushId) {
-  PushId maxValidPushId = 10 | kPushIdMask;
-  PushId validPushId = 9 | kPushIdMask;
-  PushId exceedingPushId = 11 | kPushIdMask;
+  PushId maxValidPushId = 10;
+  PushId validPushId = 9;
+  PushId exceedingPushId = 11;
 
   auto expectValid = isValidPushId(maxValidPushId, validPushId);
   EXPECT_TRUE(expectValid);
@@ -107,10 +129,7 @@ TEST_F(HQFramerTest, DataFrameZeroLength) {
   FrameHeader outHeader;
   std::unique_ptr<IOBuf> outBuf;
   Cursor cursor(queue_.front());
-  parse(HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_DATA,
-        parseData,
-        outHeader,
-        outBuf);
+  parse(folly::none, parseData, outHeader, outBuf);
 }
 
 struct FrameHeaderLengthParams {
@@ -147,16 +166,15 @@ INSTANTIATE_TEST_CASE_P(
     Values((DataOnlyFrameParams){proxygen::hq::FrameType::DATA,
                                  writeData,
                                  parseData,
-                                 HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_DATA},
-           (DataOnlyFrameParams){
-               proxygen::hq::FrameType::HEADERS,
-               writeHeaders,
-               parseHeaders,
-               HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_HEADERS}));
+                                 HTTP3::ErrorCode::HTTP_FRAME_ERROR},
+           (DataOnlyFrameParams){proxygen::hq::FrameType::HEADERS,
+                                 writeHeaders,
+                                 parseHeaders,
+                                 HTTP3::ErrorCode::HTTP_FRAME_ERROR}));
 
 TEST_F(HQFramerTest, ParsePushPromiseFrameOK) {
   auto data = makeBuf(1000);
-  PushId inPushId = 4563 | kPushIdMask;
+  PushId inPushId = 4563;
   auto result = writePushPromise(queue_, inPushId, data->clone());
   EXPECT_FALSE(result.hasError());
 
@@ -164,7 +182,7 @@ TEST_F(HQFramerTest, ParsePushPromiseFrameOK) {
   PushId outPushId;
   std::unique_ptr<IOBuf> outBuf;
   parse(folly::none, parsePushPromise, outHeader, outPushId, outBuf);
-  EXPECT_EQ(outPushId, inPushId | kPushIdMask);
+  EXPECT_EQ(outPushId, inPushId);
   EXPECT_EQ(outBuf->moveToFbString(), data->moveToFbString());
 }
 
@@ -183,10 +201,6 @@ TEST_P(HQFramerTestIdOnlyFrames, TestIdOnlyFrame) {
   {
     queue_.move();
     uint64_t validVarLenInt = 123456;
-    if (GetParam().type == proxygen::hq::FrameType::MAX_PUSH_ID ||
-        GetParam().type == proxygen::hq::FrameType::CANCEL_PUSH) {
-      validVarLenInt |= kPushIdMask;
-    }
     auto result = GetParam().writeFn(queue_, validVarLenInt);
     EXPECT_FALSE(result.hasError());
 
@@ -209,10 +223,6 @@ TEST_P(HQFramerTestIdOnlyFrames, TestIdOnlyFrame) {
   {
     queue_.move();
     uint64_t validVarLenInt = 63; // requires just 1 byte
-    if (GetParam().type == proxygen::hq::FrameType::MAX_PUSH_ID ||
-        GetParam().type == proxygen::hq::FrameType::CANCEL_PUSH) {
-      validVarLenInt |= kPushIdMask;
-    }
     auto result = GetParam().writeFn(queue_, validVarLenInt);
     EXPECT_FALSE(result.hasError());
 
@@ -233,10 +243,6 @@ TEST_P(HQFramerTestIdOnlyFrames, TestIdOnlyFrame) {
   {
     queue_.move();
     uint64_t id = 3; // requires just 1 byte
-    if (GetParam().type == proxygen::hq::FrameType::MAX_PUSH_ID ||
-        GetParam().type == proxygen::hq::FrameType::CANCEL_PUSH) {
-      id |= kPushIdMask;
-    }
     auto result = GetParam().writeFn(queue_, id);
     EXPECT_FALSE(result.hasError());
 
@@ -261,20 +267,18 @@ TEST_P(HQFramerTestIdOnlyFrames, TestIdOnlyFrame) {
 INSTANTIATE_TEST_CASE_P(
     IdOnlyFrameWriteParseTests,
     HQFramerTestIdOnlyFrames,
-    Values(
-        (IdOnlyFrameParams){proxygen::hq::FrameType::CANCEL_PUSH,
-                            writeCancelPush,
-                            parseCancelPush,
-                            HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_CANCEL_PUSH},
-        (IdOnlyFrameParams){proxygen::hq::FrameType::GOAWAY,
-                            writeGoaway,
-                            parseGoaway,
-                            HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_GOAWAY},
-        (IdOnlyFrameParams){
-            proxygen::hq::FrameType::MAX_PUSH_ID,
-            writeMaxPushId,
-            parseMaxPushId,
-            HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_MAX_PUSH_ID}));
+    Values((IdOnlyFrameParams){proxygen::hq::FrameType::CANCEL_PUSH,
+                               writeCancelPush,
+                               parseCancelPush,
+                               HTTP3::ErrorCode::HTTP_FRAME_ERROR},
+           (IdOnlyFrameParams){proxygen::hq::FrameType::GOAWAY,
+                               writeGoaway,
+                               parseGoaway,
+                               HTTP3::ErrorCode::HTTP_FRAME_ERROR},
+           (IdOnlyFrameParams){proxygen::hq::FrameType::MAX_PUSH_ID,
+                               writeMaxPushId,
+                               parseMaxPushId,
+                               HTTP3::ErrorCode::HTTP_FRAME_ERROR}));
 
 TEST_F(HQFramerTest, SettingsFrameOK) {
   deque<hq::SettingPair> settings = {
@@ -296,8 +300,7 @@ TEST_F(HQFramerTest, SettingsFrameOK) {
 }
 
 TEST_F(HQFramerTest, MaxPushIdFrameOK) {
-  // Add kPushIdMask to denote this is a max Push ID
-  PushId maxPushId = 10 | hq::kPushIdMask;
+  PushId maxPushId = 10;
   writeMaxPushId(queue_, maxPushId);
 
   FrameHeader header;
@@ -312,7 +315,7 @@ TEST_F(HQFramerTest, MaxPushIdFrameOK) {
 
 TEST_F(HQFramerTest, MaxPushIdFrameLargePushId) {
   // Test with largest possible number
-  PushId maxPushId = quic::kEightByteLimit | hq::kPushIdMask;
+  PushId maxPushId = quic::kEightByteLimit;
   writeMaxPushId(queue_, maxPushId);
 
   FrameHeader header;
@@ -327,7 +330,7 @@ TEST_F(HQFramerTest, MaxPushIdFrameLargePushId) {
 
 TEST_F(HQFramerTest, MaxPushIdTooLarge) {
   // Test kEightByteLimit + 1 as over the limit
-  PushId maxPushId = (quic::kEightByteLimit + 1) | hq::kPushIdMask;
+  PushId maxPushId = (quic::kEightByteLimit + 1);
   auto res = writeMaxPushId(queue_, maxPushId);
 
   ASSERT_TRUE(res.hasError());
@@ -351,7 +354,7 @@ TEST_P(HQFramerTestSettingsValues, ValueAllowed) {
   std::deque<hq::SettingPair> outSettings;
   ParseResult expectedParseResult = folly::none;
   if (!GetParam().allowed) {
-    expectedParseResult = HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_SETTINGS;
+    expectedParseResult = HTTP3::ErrorCode::HTTP_FRAME_ERROR;
   }
   parse(expectedParseResult, &parseSettings, header, outSettings);
 
@@ -411,10 +414,8 @@ TEST_F(HQFramerTest, SettingsFrameTrailingJunk) {
 
   FrameHeader header;
   std::deque<hq::SettingPair> outSettings;
-  parse(HTTP3::ErrorCode::HTTP_MALFORMED_FRAME_SETTINGS,
-        &parseSettings,
-        header,
-        outSettings);
+  parse(
+      HTTP3::ErrorCode::HTTP_FRAME_ERROR, &parseSettings, header, outSettings);
 }
 
 TEST_F(HQFramerTest, SettingsFrameWriteError) {
@@ -438,13 +439,40 @@ TEST_F(HQFramerTest, SettingsFrameUnknownId) {
   ASSERT_TRUE(outSettings.empty());
 }
 
-TEST_F(HQFramerTest, DecoratedPushIds) {
-  PushId testId = 10000;
-  PushId internalTestId = testId | kPushIdMask;
+TEST_F(HQFramerTest, PriorityUpdate) {
+  writePriorityUpdate(queue_, 126, "u=3, i");
+  FrameHeader header;
+  quic::StreamId outId;
+  HTTPPriority outPriority;
+  parse(folly::none, &parsePriorityUpdate, header, outId, outPriority);
 
-  ASSERT_TRUE(proxygen::hq::isExternalPushId(testId));
-  ASSERT_FALSE(proxygen::hq::isInternalPushId(testId));
+  EXPECT_EQ(126, outId);
+  EXPECT_EQ(proxygen::hq::FrameType::PRIORITY_UPDATE, header.type);
+  EXPECT_EQ(3, outPriority.urgency);
+  EXPECT_TRUE(outPriority.incremental);
+}
 
-  ASSERT_TRUE(proxygen::hq::isInternalPushId(internalTestId));
-  ASSERT_FALSE(proxygen::hq::isExternalPushId(internalTestId));
+TEST_F(HQFramerTest, PriorityUpdateWithoutIncremental) {
+  writePriorityUpdate(queue_, 357, "u=7");
+  FrameHeader header;
+  quic::StreamId outId;
+  HTTPPriority outPriority;
+  parse(folly::none, &parsePriorityUpdate, header, outId, outPriority);
+
+  EXPECT_EQ(357, outId);
+  EXPECT_EQ(proxygen::hq::FrameType::PRIORITY_UPDATE, header.type);
+  EXPECT_EQ(7, outPriority.urgency);
+  EXPECT_FALSE(outPriority.incremental);
+}
+
+TEST_F(HQFramerTest, BadPriorityUpdate) {
+  writePriorityUpdate(queue_, 357, "b=ad");
+  FrameHeader header;
+  quic::StreamId outId;
+  HTTPPriority outPriority;
+  parse(HTTP3::ErrorCode::HTTP_FRAME_ERROR,
+        &parsePriorityUpdate,
+        header,
+        outId,
+        outPriority);
 }

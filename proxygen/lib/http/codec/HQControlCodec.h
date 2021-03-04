@@ -11,6 +11,7 @@
 #include <proxygen/lib/http/codec/HQFramedCodec.h>
 #include <proxygen/lib/http/codec/HQFramer.h>
 #include <proxygen/lib/http/codec/HQUnidirectionalCodec.h>
+#include <proxygen/lib/http/codec/HQUtils.h>
 #include <proxygen/lib/http/codec/HTTPCodec.h>
 #include <proxygen/lib/http/codec/compress/QPACKCodec.h>
 
@@ -35,6 +36,9 @@ class HQControlCodec
         settings_(settings) {
     VLOG(4) << "creating " << getTransportDirectionString(direction)
             << " HQ Control codec for stream " << streamId_;
+    egressGoawayAck_ = direction == TransportDirection::UPSTREAM
+                           ? kMaxPushId + 1
+                           : kMaxClientBidiStreamId;
   }
 
   ~HQControlCodec() override {
@@ -55,7 +59,7 @@ class HQControlCodec
     if (callback_) {
       HTTPException ex(HTTPException::Direction::INGRESS_AND_EGRESS,
                        "Control stream EOF");
-      ex.setErrno(uint32_t(HTTP3::ErrorCode::HTTP_CLOSED_CRITICAL_STREAM));
+      ex.setHttp3ErrorCode(HTTP3::ErrorCode::HTTP_CLOSED_CRITICAL_STREAM);
       callback_->onError(streamId_, ex, false);
     }
   }
@@ -86,7 +90,15 @@ class HQControlCodec
 
   size_t generatePriority(folly::IOBufQueue& writeBuf,
                           StreamID stream,
-                          const HTTPMessage::HTTPPriority& pri) override;
+                          const HTTPMessage::HTTP2Priority& pri) override;
+
+  size_t generatePriority(folly::IOBufQueue& writeBuf,
+                          StreamID stream,
+                          HTTPPriority priority) override;
+
+  size_t generatePushPriority(folly::IOBufQueue& writeBuf,
+                              StreamID pushId,
+                              HTTPPriority priority) override;
 
   const HTTPSettings* getIngressSettings() const override {
     CHECK(isIngress());
@@ -98,13 +110,13 @@ class HQControlCodec
     return &settings_;
   }
 
+  void enableDoubleGoawayDrain() override {
+    doubleGoaway_ = true;
+  }
+
   uint32_t getDefaultWindowSize() const override {
     CHECK(false) << __func__ << " not supported";
     folly::assume_unreachable();
-  }
-
-  bool peerHasWebsockets() const {
-    return false;
   }
 
   void setHeaderCodecStats(HeaderCodec::Stats* /*hcStats*/) override {
@@ -132,12 +144,22 @@ class HQControlCodec
                           const FrameHeader& header) override;
   ParseResult parseMaxPushId(folly::io::Cursor& cursor,
                              const FrameHeader& header) override;
+  ParseResult parsePriorityUpdate(folly::io::Cursor& cursor,
+                                  const FrameHeader& header) override;
+  ParseResult parsePushPriorityUpdate(folly::io::Cursor& cursor,
+                                      const FrameHeader& header) override;
+
+  uint64_t finalGoawayId();
 
  private:
+  bool doubleGoaway_{true};
   bool sentGoaway_{false};
+  bool sentFinalGoaway_{false};
   bool receivedSettings_{false};
   bool sentSettings_{false};
-  quic::StreamId maxSeenLastStream_{quic::kEightByteLimit};
+  quic::StreamId egressGoawayAck_;
+  quic::StreamId minUnseenStreamID_{kMaxClientBidiStreamId};
+  uint64_t minUnseenPushID_{kMaxPushId + 1};
   HTTPSettings& settings_;
 };
 

@@ -75,6 +75,9 @@ class HQDownstreamSession : public HQSession {
     return static_cast<uint32_t>(streams_.size());
   }
 
+  folly::Optional<HTTPHeaders> getExtraHeaders(
+      const HTTPMessage& haeders, quic::StreamId streamId) override;
+
  private:
   ~HQDownstreamSession() override {
     CHECK_EQ(getNumStreams(), 0);
@@ -105,7 +108,7 @@ class HQDownstreamSession : public HQSession {
         : detail::singlestream::SSEgress(streamId),
           HQStreamTransportBase(session,
                                 TransportDirection::DOWNSTREAM,
-                                static_cast<HTTPCodec::StreamID>(pushId),
+                                streamId,
                                 seqNo,
                                 timeout,
                                 stats,
@@ -194,7 +197,6 @@ class HQDownstreamSession : public HQSession {
   hq::PushId createNewPushId();
 
   // Value of the next pushId, used for outgoing push transactions
-  // This variable does not have the hq::kPushIdMask set
   hq::PushId nextAvailablePushId_{0};
 };
 

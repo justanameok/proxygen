@@ -269,30 +269,11 @@ class HTTPTransactionHandler : public TraceEventObserver {
   }
 
   /**
-   * Inform the handler that unframed body is starting.
-   */
-  virtual void onUnframedBodyStarted(uint64_t /* offset */) noexcept {
-  }
-
-  /**
    * Inform the handler that data arrived into underlying transport's read
    * buffer.
    */
   virtual void onBodyPeek(uint64_t /* offset */,
                           const folly::IOBuf& /* chain */) noexcept {
-  }
-
-  /**
-   * Inform the handler that the sender skipped data below certain offset.
-   */
-  virtual void onBodySkipped(uint64_t /* offset */) noexcept {
-  }
-
-  /**
-   * Inform the handler that the receiver doesn't expect data under certain
-   * offset anymore.
-   */
-  virtual void onBodyRejected(uint64_t /* offset */) noexcept {
   }
 
   virtual ~HTTPTransactionHandler() {
@@ -371,6 +352,7 @@ class HTTPTransactionTransportCallback {
 
   virtual void headerBytesReceived(const HTTPHeaderSize& size) noexcept = 0;
 
+  // May include extra bytes for EOF/trailers
   virtual void bodyBytesGenerated(size_t nbytes) noexcept = 0;
 
   virtual void bodyBytesReceived(size_t size) noexcept = 0;
@@ -459,6 +441,8 @@ class HTTPTransaction
 
     virtual size_t sendPriority(HTTPTransaction* txn,
                                 const http2::PriorityUpdate& pri) noexcept = 0;
+    virtual size_t changePriority(HTTPTransaction* txn,
+                                  HTTPPriority pri) noexcept = 0;
 
     virtual size_t sendWindowUpdate(HTTPTransaction* txn,
                                     uint32_t bytes) noexcept = 0;
@@ -477,15 +461,15 @@ class HTTPTransaction
 
     virtual void describe(std::ostream&) const = 0;
 
-    virtual const wangle::TransportInfo& getSetupTransportInfo() const
-        noexcept = 0;
+    virtual const wangle::TransportInfo& getSetupTransportInfo()
+        const noexcept = 0;
 
     virtual bool getCurrentTransportInfo(wangle::TransportInfo* tinfo) = 0;
 
     virtual void getFlowControlInfo(FlowControlInfo* info) = 0;
 
-    virtual HTTPTransaction::Transport::Type getSessionType() const
-        noexcept = 0;
+    virtual HTTPTransaction::Transport::Type getSessionType()
+        const noexcept = 0;
 
     virtual const HTTPCodec& getCodec() const noexcept = 0;
 
@@ -517,8 +501,8 @@ class HTTPTransaction
 
     virtual bool needToBlockForReplaySafety() const = 0;
 
-    virtual const folly::AsyncTransport* getUnderlyingTransport() const
-        noexcept = 0;
+    virtual const folly::AsyncTransport* getUnderlyingTransport()
+        const noexcept = 0;
 
     /**
      * Returns true if the underlying transport has completed full handshake.
@@ -530,7 +514,7 @@ class HTTPTransaction
 
     virtual HTTPSessionBase* getHTTPSessionBase() = 0;
 
-    virtual folly::Optional<const HTTPMessage::HTTPPriority> getHTTPPriority(
+    virtual folly::Optional<const HTTPMessage::HTTP2Priority> getHTTPPriority(
         uint8_t level) = 0;
 
     virtual folly::Expected<folly::Unit, ErrorCode> peek(
@@ -541,24 +525,6 @@ class HTTPTransaction
 
     virtual folly::Expected<folly::Unit, ErrorCode> consume(
         size_t /* amount */) {
-      LOG(FATAL) << __func__ << " not supported";
-      folly::assume_unreachable();
-    }
-
-    /**
-     * Notify peer that the data below the offset isn't going to be sent.
-     */
-    virtual folly::Expected<folly::Optional<uint64_t>, ErrorCode> skipBodyTo(
-        HTTPTransaction* /* txn */, uint64_t /* nextBodyOffset */) {
-      LOG(FATAL) << __func__ << " not supported";
-      folly::assume_unreachable();
-    }
-
-    /**
-     * Notify peer that the data below the offset is not needed anymore.
-     */
-    virtual folly::Expected<folly::Optional<uint64_t>, ErrorCode> rejectBodyTo(
-        HTTPTransaction* /* txn */, uint64_t /* nextBodyOffset */) {
       LOG(FATAL) << __func__ << " not supported";
       folly::assume_unreachable();
     }
@@ -593,7 +559,7 @@ class HTTPTransaction
       Transport& transport,
       HTTP2PriorityQueueBase& egressQueue,
       folly::HHWheelTimer* timer = nullptr,
-      const folly::Optional<std::chrono::milliseconds>& defaultTimeout =
+      const folly::Optional<std::chrono::milliseconds>& defaultIdleTimeout =
           folly::Optional<std::chrono::milliseconds>(),
       HTTPSessionStats* stats = nullptr,
       bool useFlowControl = false,
@@ -602,7 +568,8 @@ class HTTPTransaction
       http2::PriorityUpdate = http2::DefaultPriority,
       folly::Optional<HTTPCodec::StreamID> assocStreamId = HTTPCodec::NoStream,
       folly::Optional<HTTPCodec::ExAttributes> exAttributes =
-          HTTPCodec::NoExAttributes);
+          HTTPCodec::NoExAttributes,
+      bool setIngressTimeoutAfterEom = false);
 
   ~HTTPTransaction() override;
 
@@ -820,16 +787,6 @@ class HTTPTransaction
   void onIngressSetSendWindow(uint32_t newWindowSize);
 
   /**
-   * Ivoked by the session when it gets the start of the unframed body.
-   */
-  void onIngressUnframedBodyStarted(uint64_t offset) {
-    partiallyReliable_ = true;
-    if (handler_) {
-      handler_->onUnframedBodyStarted(offset);
-    }
-  }
-
-  /**
    * Notify this transaction that it is ok to egress.  Returns true if there
    * is additional pending egress
    */
@@ -910,20 +867,6 @@ class HTTPTransaction
    * layer.
    */
   void onIngressBodyPeek(uint64_t bodyOffset, const folly::IOBuf& chain);
-
-  /**
-   * Invoked by the session when transaction receives a skip from the peer.
-   *
-   * @param nextBodyOffset      Next body offset set by the sender.
-   */
-  void onIngressBodySkipped(uint64_t nextBodyOffset);
-
-  /**
-   * Invoked by the session when transaction receives a reject from the peer.
-   *
-   * @param nextBodyOffset  Next body offset set by the receiver.
-   */
-  void onIngressBodyRejected(uint64_t nextBodyOffset);
 
   /**
    * Invoked by the handlers that are interested in tracking
@@ -1290,25 +1233,12 @@ class HTTPTransaction
   }
 
   /**
-   * Sets a transaction timeout value. If such a timeout was set, this
-   * timeout will be used instead of the default timeout interval configured
-   * in transactionIdleTimeouts_.
+   * Overrides the default idle timeout value.
    */
-  void setIdleTimeout(std::chrono::milliseconds transactionTimeout);
+  void setIdleTimeout(std::chrono::milliseconds idleTimeout);
 
-  /**
-   * Does this transaction have an idle timeout set?
-   */
   bool hasIdleTimeout() const {
-    return transactionTimeout_.has_value();
-  }
-
-  /**
-   * Returns the transaction timeout if exists. An OptionalEmptyException is
-   * raised if the timeout isn't set.
-   */
-  std::chrono::milliseconds getIdleTimeout() const {
-    return transactionTimeout_.value();
+    return idleTimeout_.has_value();
   }
 
   /**
@@ -1363,11 +1293,11 @@ class HTTPTransaction
   }
 
   /**
-   * Schedule or refresh the timeout for this transaction
+   * Schedule or refresh the idle timeout for this transaction
    */
   void refreshTimeout() {
     if (timer_ && hasIdleTimeout()) {
-      timer_->scheduleTimeout(this, transactionTimeout_.value());
+      timer_->scheduleTimeout(this, idleTimeout_.value());
     }
   }
 
@@ -1436,10 +1366,13 @@ class HTTPTransaction
   void describe(std::ostream& os) const;
 
   /**
-   * Change the priority of this transaction, may generate a PRIORITY frame
+   * Change the priority of this transaction, may generate a PRIORITY frame.
+   * The first variant is SPDY priority. The second is HTTP/2 priority. The
+   * third one is a new proposal in a draft for both HTTP/2 and HTTP/3.
    */
   void updateAndSendPriority(int8_t newPriority);
   void updateAndSendPriority(const http2::PriorityUpdate& pri);
+  virtual void updateAndSendPriority(uint8_t urgency, bool incremental);
 
   /**
    * Notify of priority change, will not generate a PRIORITY frame
@@ -1546,37 +1479,16 @@ class HTTPTransaction
    */
   folly::Expected<folly::Unit, ErrorCode> consume(size_t amount);
 
-  /**
-   * Allows the sender to skip part of the egress body. Calls can be interleaved
-   * with sendBody() calls.
-   * Upon receipt by the peer, this signals that the body up to bodyOffset shall
-   * not be expected. Note that some bytes before this new advertised offset
-   * might still be received by the peer if they were already in transmission
-   * between the peers.
-   *
-   * @param bodyOffset  New offset the sender is going to start sending the body
-   *                    from going forward.
-   */
-  folly::Expected<folly::Optional<uint64_t>, ErrorCode> skipBodyTo(
-      uint64_t nextBodyOffset);
-
-  /**
-   * Similar to skipBodyTo() above, rejectBodyTo() allows the receiver to signal
-   * to the sender that body bytes below bodyOffset are not expected anymore and
-   * the sender needs to start sending from the new offset.
-   * Note that the receiver may still receive some bytes below this new
-   * advertised offset if any were in flight between the two peers.
-   *
-   * @param bodyOffset  New offset the sender needs to start sending from.
-   */
-  folly::Expected<folly::Optional<uint64_t>, ErrorCode> rejectBodyTo(
-      uint64_t nextBodyOffset);
-
   folly::Optional<ConnectionToken> getConnectionToken() const noexcept;
 
  private:
   HTTPTransaction(const HTTPTransaction&) = delete;
   HTTPTransaction& operator=(const HTTPTransaction&) = delete;
+
+  void dequeue() {
+    CHECK(isEnqueued());
+    egressQueue_.clearPendingEgress(queueHandle_);
+  }
 
   void onDelayedDestroy(bool delayed) override;
 
@@ -1630,12 +1542,7 @@ class HTTPTransaction
   bool maybeDelayForRateLimit();
 
   bool isEnqueued() const {
-    return queueHandle_->isEnqueued();
-  }
-
-  void dequeue() {
-    DCHECK(isEnqueued());
-    egressQueue_.clearPendingEgress(queueHandle_);
+    return queueHandle_ ? queueHandle_->isEnqueued() : false;
   }
 
   bool hasPendingEOM() const {
@@ -1703,8 +1610,6 @@ class HTTPTransaction
    */
   std::unique_ptr<std::queue<HTTPEvent>> deferredIngress_;
 
-  uint32_t maxDeferredIngress_{0};
-
   /**
    * Queue to hold any body bytes to be sent out
    * while egress to the remote is supposed to be paused.
@@ -1712,14 +1617,20 @@ class HTTPTransaction
   folly::IOBufQueue deferredEgressBody_{folly::IOBufQueue::cacheChainLength()};
 
   const TransportDirection direction_;
-  HTTPCodec::StreamID id_;
-  uint32_t seqNo_;
-  Handler* handler_{nullptr};
-  Transport& transport_;
   HTTPTransactionEgressSM::State egressState_{
       HTTPTransactionEgressSM::getNewInstance()};
   HTTPTransactionIngressSM::State ingressState_{
       HTTPTransactionIngressSM::getNewInstance()};
+  /**
+   * bytes we need to acknowledge to the remote end using a window update
+   */
+  int32_t recvToAck_{0};
+
+  HTTPCodec::StreamID id_;
+  uint32_t seqNo_;
+  uint32_t maxDeferredIngress_{0};
+  Handler* handler_{nullptr};
+  Transport& transport_;
 
   HTTPSessionStats* stats_{nullptr};
 
@@ -1760,12 +1671,7 @@ class HTTPTransaction
   /**
    * Handle to our position in the priority queue.
    */
-  HTTP2PriorityQueueBase::Handle queueHandle_;
-
-  /**
-   * bytes we need to acknowledge to the remote end using a window update
-   */
-  int32_t recvToAck_{0};
+  HTTP2PriorityQueueBase::Handle queueHandle_{nullptr};
 
   /**
    * ID of request transaction (for pushed txns only)
@@ -1808,14 +1714,6 @@ class HTTPTransaction
   double cumulativeRatio_{0};
   uint64_t egressCalls_{0};
 
-  /**
-   * If this transaction represents a request (ie, it is backed by an
-   * HTTPUpstreamSession) , this field indicates the last response status
-   * received from the server. If this transaction represents a response,
-   * this field indicates the last status we've sent. For instances, this
-   * could take on multiple 1xx values, and then take on 200.
-   */
-  uint16_t lastResponseStatus_{0};
   uint64_t pendingByteEvents_{0};
   folly::Optional<uint64_t> expectedIngressContentLength_;
   folly::Optional<uint64_t> expectedIngressContentLengthRemaining_;
@@ -1842,6 +1740,23 @@ class HTTPTransaction
   bool headRequest_ : 1;
   bool enableLastByteFlushedTracking_ : 1;
   bool enableBodyLastByteDeliveryTracking_ : 1;
+  // Signals if the transaction is partially reliable.
+  // Set on first sendHeaders() call on egress or with setPartiallyReliable() on
+  // ingress.
+  bool partiallyReliable_ : 1;
+
+  // Prevents the application from calling skipBodyTo() before egress
+  // headers have been delivered.
+  bool egressHeadersDelivered_ : 1;
+
+  /**
+   * If this transaction represents a request (ie, it is backed by an
+   * HTTPUpstreamSession) , this field indicates the last response status
+   * received from the server. If this transaction represents a response,
+   * this field indicates the last status we've sent. For instances, this
+   * could take on multiple 1xx values, and then take on 200.
+   */
+  uint16_t lastResponseStatus_{0};
 
   static uint64_t egressBufferLimit_;
 
@@ -1849,28 +1764,18 @@ class HTTPTransaction
   proxygen::TimePoint startRateLimit_;
   uint64_t numLimitedBytesEgressed_{0};
 
-  /**
-   * Optional transaction timeout value.
-   */
-  folly::Optional<std::chrono::milliseconds> transactionTimeout_;
+  folly::Optional<std::chrono::milliseconds> idleTimeout_;
 
   folly::HHWheelTimer* timer_;
 
   class PrioritySample;
   std::unique_ptr<PrioritySample> prioritySample_;
 
-  // Signals if the transaction is partially reliable.
-  // Set on first sendHeaders() call on egress or with setPartiallyReliable() on
-  // ingress.
-  bool partiallyReliable_{false};
-
-  // Prevents the application from calling skipBodyTo() before egress
-  // headers have been delivered.
-  bool egressHeadersDelivered_{false};
-
   // Keeps track for body offset processed so far.
   // Includes skipped bytes for partially reliable transactions.
   uint64_t ingressBodyOffset_{0};
+
+  bool setIngressTimeoutAfterEom_{false};
 };
 
 /**

@@ -15,6 +15,8 @@
 #include <folly/io/Cursor.h>
 
 #include <proxygen/lib/http/HTTP3ErrorCode.h>
+#include <proxygen/lib/http/codec/CodecUtil.h>
+#include <proxygen/lib/http/codec/HTTPCodec.h>
 #include <proxygen/lib/http/codec/SettingsId.h>
 #include <quic/codec/QuicInteger.h>
 #include <quic/codec/Types.h>
@@ -30,28 +32,9 @@ const uint64_t kMaxGreaseIdIndex = 0x210842108421083;
 // Unframed body DATA frame length.
 const size_t kUnframedDataFrameLen = 0;
 
-// PushID mask
-// to make sure push id and stream id spaces are disjoint
-const uint64_t kPushIdMask = ((uint64_t)1) << 63;
-
 //////// Types ////////
 
 using PushId = uint64_t;
-
-// Internally the push IDs have a high bit set
-// to prevent a collision with a stream id.
-bool isInternalPushId(PushId pushId);
-
-// Externally the push IDs do not have the high bit
-// set.
-bool isExternalPushId(PushId pushId);
-
-// Validate the given push ID.
-bool isValidPushId(folly::Optional<PushId> /* max valid push id value */,
-                   PushId /* push id to validate */);
-
-// Compare push IDs after stripping the kPushBitMask
-bool comparePushId(PushId /* lhs */, PushId /* rhs */);
 
 using ParseResult = folly::Optional<HTTP3::ErrorCode>;
 using WriteResult = folly::Expected<size_t, quic::TransportErrorCode>;
@@ -67,7 +50,11 @@ enum class FrameType : uint64_t {
   // 0x08 reserved
   // 0x09 reserved
   MAX_PUSH_ID = 0x0D,
+  PRIORITY_UPDATE = 0xF700,
+  PUSH_PRIORITY_UPDATE = 0xF701,
 };
+
+std::ostream& operator<<(std::ostream& os, FrameType type);
 
 struct FrameHeader {
   FrameType type;
@@ -86,7 +73,6 @@ using SettingPair = std::pair<SettingId, SettingValue>;
 //////// Functions ////////
 folly::Optional<uint64_t> getGreaseId(uint64_t n);
 bool isGreaseId(uint64_t id);
-bool frameAffectsCompression(FrameType type);
 
 //// Parsing ////
 
@@ -195,6 +181,22 @@ ParseResult parseGoaway(folly::io::Cursor& cursor,
 ParseResult parseMaxPushId(folly::io::Cursor& cursor,
                            const FrameHeader& header,
                            PushId& outPushId) noexcept;
+
+/**
+ * This API parses PRIORITY_UPDATE or PUSH_PRIORITY_UPDATE frames.
+ *
+ * @param cursor The cursor to pull input data from.
+ * @param header The frame header for the frame being parsed.
+ * @param outId The prioritized element. It's either a stream id or a push id.
+ *              This is an output parameter.
+ * @param priorityUpdate The Priority Field Value parsed into a
+ *                       HTTPPriority struct. This is an output parameter.
+ * @return folly::none if parsing is successful, otherwise a http error code.
+ */
+ParseResult parsePriorityUpdate(folly::io::Cursor& cursor,
+                                const FrameHeader& header,
+                                HTTPCodec::StreamID& outId,
+                                HTTPPriority& priorityUpdate) noexcept;
 
 //// Egress ////
 
@@ -311,5 +313,22 @@ WriteResult writeGoaway(folly::IOBufQueue& writeBuf,
  */
 WriteResult writeMaxPushId(folly::IOBufQueue& writeBuf,
                            PushId maxPushId) noexcept;
+
+/**
+ * Write a PRIORITY_UPDATE frame on the writeBuf.
+ */
+WriteResult writePriorityUpdate(folly::IOBufQueue& writeBuf,
+                                quic::StreamId streamId,
+                                folly::StringPiece priorityUpdate) noexcept;
+
+/**
+ * Write a PUSH_PRIORITY_UPDATE frame on the writeBuf.
+ */
+WriteResult writePushPriorityUpdate(folly::IOBufQueue& writeBuf,
+                                    hq::PushId pushId,
+                                    folly::StringPiece priorityUpdate) noexcept;
+
+WriteResult writeStreamPreface(folly::IOBufQueue& writeBuf,
+                               uint64_t streamPreface) noexcept;
 
 }} // namespace proxygen::hq

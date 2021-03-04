@@ -7,6 +7,7 @@
  */
 
 #include <proxygen/lib/http/session/HTTPUpstreamSession.h>
+
 #include <proxygen/lib/http/session/HTTPSessionController.h>
 
 #include <folly/io/async/AsyncSSLSocket.h>
@@ -180,13 +181,16 @@ void HTTPUpstreamSession::detachTransactions() {
 void HTTPUpstreamSession::attachThreadLocals(
     folly::EventBase* eventBase,
     folly::SSLContextPtr sslContext,
-    const WheelTimerInstance& timeout,
+    const WheelTimerInstance& wheelTimer,
     HTTPSessionStats* stats,
     FilterIteratorFn fn,
     HeaderCodec::Stats* headerCodecStats,
     HTTPSessionController* controller) {
-  txnEgressQueue_.attachThreadLocals(timeout);
-  timeout_ = timeout;
+  txnEgressQueue_.attachThreadLocals(wheelTimer);
+  if (controlMessageRateLimitFilter_) {
+    controlMessageRateLimitFilter_->attachThreadLocals(&eventBase->timer());
+  }
+  wheelTimer_ = wheelTimer;
   setController(controller);
   setSessionStats(stats);
   if (sock_) {
@@ -220,6 +224,9 @@ void HTTPUpstreamSession::detachThreadLocals(bool detachSSLContext) {
     sock_->detachEventBase();
   }
   txnEgressQueue_.detachThreadLocals();
+  if (controlMessageRateLimitFilter_) {
+    controlMessageRateLimitFilter_->detachThreadLocals();
+  }
   setController(nullptr);
   setSessionStats(nullptr);
   // The codec filters *shouldn't* be accessible while the socket is detached,

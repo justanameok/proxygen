@@ -7,6 +7,7 @@
  */
 
 #include <proxygen/lib/http/structuredheaders/StructuredHeadersEncoder.h>
+
 #include <folly/Conv.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
@@ -276,6 +277,32 @@ TEST_F(StructuredHeadersEncoderTest, TestDictionaryOneElt) {
 
   EXPECT_EQ(err, EncodeError::OK);
   EXPECT_EQ(encoder.get(), "e=2.71");
+}
+
+TEST_F(StructuredHeadersEncoderTest, TestDictionaryWithTrueBoolean) {
+  StructuredHeaders::Dictionary dict;
+  StructuredHeaderItem item;
+  item.tag = StructuredHeaderItem::Type::BOOLEAN;
+  item.value = true;
+
+  dict["u"] = item;
+
+  StructuredHeadersEncoder encoder;
+  EXPECT_EQ(EncodeError::OK, encoder.encodeDictionary(dict));
+  EXPECT_EQ(encoder.get(), "u");
+}
+
+TEST_F(StructuredHeadersEncoderTest, TestDictionaryWithFalseBoolean) {
+  StructuredHeaders::Dictionary dict;
+  StructuredHeaderItem item;
+  item.tag = StructuredHeaderItem::Type::BOOLEAN;
+  item.value = false;
+
+  dict["u"] = item;
+
+  StructuredHeadersEncoder encoder;
+  EXPECT_EQ(EncodeError::OK, encoder.encodeDictionary(dict));
+  EXPECT_EQ(encoder.get(), "u=?0");
 }
 
 TEST_F(StructuredHeadersEncoderTest, TestDictionaryManyElts) {

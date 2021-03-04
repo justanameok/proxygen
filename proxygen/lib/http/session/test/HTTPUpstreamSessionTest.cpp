@@ -7,6 +7,7 @@
  */
 
 #include <proxygen/lib/http/session/HTTPUpstreamSession.h>
+
 #include <folly/io/Cursor.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/TimeoutManager.h>
@@ -47,7 +48,7 @@ class TestPriorityMapBuilder : public HTTPUpstreamSession::PriorityMapFactory {
 
 class TestPriorityAdapter : public HTTPUpstreamSession::PriorityAdapter {
  public:
-  folly::Optional<const HTTPMessage::HTTPPriority> getHTTPPriority(
+  folly::Optional<const HTTPMessage::HTTP2Priority> getHTTPPriority(
       uint8_t level) override {
     if (priorityMap_.empty()) {
       return folly::none;
@@ -61,13 +62,13 @@ class TestPriorityAdapter : public HTTPUpstreamSession::PriorityAdapter {
 
   ~TestPriorityAdapter() override = default;
 
-  std::map<uint8_t, HTTPMessage::HTTPPriority> priorityMap_;
-  HTTPMessage::HTTPPriority minPriority_{std::make_tuple(0, false, 0)};
+  std::map<uint8_t, HTTPMessage::HTTP2Priority> priorityMap_;
+  HTTPMessage::HTTP2Priority minPriority_{std::make_tuple(0, false, 0)};
   HTTPCodec::StreamID parentId_{0};
   HTTPCodec::StreamID hiPriId_{0};
   HTTPCodec::StreamID loPriId_{0};
-  HTTPMessage::HTTPPriority hiPri_{std::make_tuple(0, false, 0)};
-  HTTPMessage::HTTPPriority loPri_{std::make_tuple(0, false, 0)};
+  HTTPMessage::HTTP2Priority hiPri_{std::make_tuple(0, false, 0)};
+  HTTPMessage::HTTP2Priority loPri_{std::make_tuple(0, false, 0)};
 };
 
 std::unique_ptr<HTTPUpstreamSession::PriorityAdapter>
@@ -200,6 +201,8 @@ class HTTPUpstreamTest
     EXPECT_CALL(*transport_, good())
         .WillRepeatedly(ReturnPointee(&transportGood_));
     EXPECT_CALL(*transport_, closeNow())
+        .WillRepeatedly(Assign(&transportGood_, false));
+    EXPECT_CALL(*transport_, shutdownWriteNow())
         .WillRepeatedly(Assign(&transportGood_, false));
     EXPECT_CALL(*transport_, isReplaySafe()).WillOnce(Return(false));
     EXPECT_CALL(*transport_, setReplaySafetyCallback(_))
@@ -622,7 +625,7 @@ TEST_F(HTTP2UpstreamSessionTest, TestPriority) {
 
   auto req = getGetRequest();
   // send request with maximal weight
-  req.setHTTP2Priority(HTTPMessage::HTTPPriority(0, false, 255));
+  req.setHTTP2Priority(HTTPMessage::HTTP2Priority(0, false, 255));
   handler1->sendRequest(req);
   handler2->sendRequest(req);
 
@@ -647,32 +650,34 @@ TEST_F(HTTP2UpstreamSessionTest, TestPriority) {
   NiceMock<MockHTTPCodecCallback> callbacks;
   serverCodec->setCallback(&callbacks);
   EXPECT_CALL(callbacks,
-              onPriority(priGroupID, HTTPMessage::HTTPPriority(0, false, 7)));
+              onPriority(priGroupID, HTTPMessage::HTTP2Priority(0, false, 7)));
   EXPECT_CALL(callbacks, onHeadersComplete(id, _))
       .WillOnce(
           Invoke([&](HTTPCodec::StreamID, std::shared_ptr<HTTPMessage> msg) {
             EXPECT_EQ(*(msg->getHTTP2Priority()),
-                      HTTPMessage::HTTPPriority(0, false, 255));
+                      HTTPMessage::HTTP2Priority(0, false, 255));
           }));
   EXPECT_CALL(callbacks, onHeadersComplete(id2, _))
       .WillOnce(
           Invoke([&](HTTPCodec::StreamID, std::shared_ptr<HTTPMessage> msg) {
             EXPECT_EQ(*(msg->getHTTP2Priority()),
-                      HTTPMessage::HTTPPriority(0, false, 255));
+                      HTTPMessage::HTTP2Priority(0, false, 255));
           }));
-  EXPECT_CALL(callbacks,
-              onPriority(id, HTTPMessage::HTTPPriority(priGroupID, false, 15)));
   EXPECT_CALL(
       callbacks,
-      onPriority(id2, HTTPMessage::HTTPPriority(priGroupID + 254, false, 15)));
+      onPriority(id, HTTPMessage::HTTP2Priority(priGroupID, false, 15)));
+  EXPECT_CALL(
+      callbacks,
+      onPriority(id2, HTTPMessage::HTTP2Priority(priGroupID + 254, false, 15)));
   EXPECT_EQ(handler1->txn_->getPriorityFallback(), false);
   EXPECT_EQ(handler2->txn_->getPriorityFallback(), false);
 
   EXPECT_EQ(std::get<1>(handler1->txn_->getPrioritySummary()), 2);
   // created virtual parent node
   EXPECT_EQ(std::get<1>(handler2->txn_->getPrioritySummary()), 2);
-  EXPECT_CALL(callbacks,
-              onPriority(priGroupID, HTTPMessage::HTTPPriority(0, false, 255)));
+  EXPECT_CALL(
+      callbacks,
+      onPriority(priGroupID, HTTPMessage::HTTP2Priority(0, false, 255)));
   parseOutput(*serverCodec);
   eventBase_.loop();
 
@@ -691,7 +696,7 @@ TEST_F(HTTP2UpstreamSessionTest, TestCircularPriority) {
 
   auto req = getGetRequest();
   // send request with circular dep
-  req.setHTTP2Priority(HTTPMessage::HTTPPriority(1, false, 255));
+  req.setHTTP2Priority(HTTPMessage::HTTP2Priority(1, false, 255));
   handler1->sendRequest(req);
   handler1->terminate();
   handler1->expectDetachTransaction();
@@ -990,10 +995,10 @@ TEST_F(HTTP2UpstreamSessionWithPriorityTree, PriorityTree) {
   // It should have built the virtual streams from the tree but not the old
   // priority levels.
   EXPECT_EQ(dependencies.size(), 0);
-  HTTPMessage::HTTPPriority hiPri =
+  HTTPMessage::HTTP2Priority hiPri =
       *httpSession_->getHTTPPriority(builder_->hiPriLevel_);
   EXPECT_EQ(std::get<2>(hiPri), builder_->hiPriWeight_);
-  HTTPMessage::HTTPPriority loPri =
+  HTTPMessage::HTTP2Priority loPri =
       *httpSession_->getHTTPPriority(builder_->loPriLevel_);
   EXPECT_EQ(std::get<2>(loPri), builder_->loPriWeight_);
 
@@ -1001,7 +1006,7 @@ TEST_F(HTTP2UpstreamSessionWithPriorityTree, PriorityTree) {
     if (level == builder_->hiPriLevel_) {
       continue;
     }
-    HTTPMessage::HTTPPriority pri = *httpSession_->getHTTPPriority(level);
+    HTTPMessage::HTTP2Priority pri = *httpSession_->getHTTPPriority(level);
     EXPECT_EQ(pri, loPri);
   }
 
@@ -1307,6 +1312,78 @@ TEST_F(HTTPUpstreamTimeoutTest, WriteTimeoutAfterResponse) {
       "0\r\n\r\n");
 }
 
+TEST_F(HTTPUpstreamTimeoutTest, SetIngressTimeoutAfterSendEom) {
+  InSequence enforceOrder;
+  httpSession_->setIngressTimeoutAfterEom(true);
+
+  auto handler1 = openTransaction();
+  handler1->expectHeaders();
+  handler1->expectEOM();
+  handler1->expectDetachTransaction();
+
+  // Send EOM separately.
+  auto transaction1 = handler1->txn_;
+  EXPECT_TRUE(transaction1->hasIdleTimeout());
+  transaction1->setIdleTimeout(std::chrono::milliseconds(100));
+  EXPECT_FALSE(transaction1->isScheduled());
+
+  transaction1->sendHeaders(getPostRequest());
+  eventBase_.loopOnce();
+  EXPECT_FALSE(transaction1->isScheduled());
+
+  transaction1->sendBody(makeBuf(100) /* body */);
+  eventBase_.loopOnce();
+  EXPECT_FALSE(transaction1->isScheduled());
+
+  transaction1->sendEOM();
+  eventBase_.loopOnce();
+  EXPECT_TRUE(transaction1->isScheduled());
+  readAndLoop(
+      "HTTP/1.1 200 OK\r\n"
+      "Transfer-Encoding: chunked\r\n\r\n"
+      "0\r\n\r\n");
+
+  // Send EOM with header.
+  auto handler2 = openTransaction();
+  handler2->expectHeaders();
+  handler2->expectEOM();
+  handler2->expectDetachTransaction();
+
+  auto transaction2 = handler2->txn_;
+  EXPECT_FALSE(transaction2->isScheduled());
+  transaction2->sendHeadersWithOptionalEOM(getPostRequest(), true /* eom */);
+  eventBase_.loopOnce();
+  EXPECT_TRUE(transaction2->isScheduled());
+
+  readAndLoop(
+      "HTTP/1.1 200 OK\r\n"
+      "Transfer-Encoding: chunked\r\n\r\n"
+      "0\r\n\r\n");
+
+  // Send EOM with body.
+  auto handler3 = openTransaction();
+  handler3->expectHeaders();
+  handler3->expectEOM();
+  handler3->expectDetachTransaction();
+
+  auto transaction3 = handler3->txn_;
+  EXPECT_FALSE(transaction3->isScheduled());
+  transaction3->sendHeaders(getPostRequest());
+  eventBase_.loopOnce();
+  EXPECT_FALSE(transaction3->isScheduled());
+  transaction3->sendBody(makeBuf(100) /* body */);
+  transaction3->sendEOM();
+  eventBase_.loopOnce();
+  EXPECT_TRUE(transaction3->isScheduled());
+
+  readAndLoop(
+      "HTTP/1.1 200 OK\r\n"
+      "Transfer-Encoding: chunked\r\n\r\n"
+      "0\r\n\r\n");
+
+  httpSession_->destroy();
+}
+
 TEST_F(HTTPUpstreamSessionTest, SetTransactionTimeout) {
   // Test that setting a new timeout on the transaction will cancel
   // the old one.
@@ -1412,17 +1489,21 @@ TEST_F(HTTPUpstreamSessionTest, 101Upgrade) {
   handler->expectEOM();
   handler->expectDetachTransaction();
 
-  handler->sendRequest(req);
+  handler->txn_->sendHeaders(req);
   eventBase_.loop();
   readAndLoop(
       "HTTP/1.1 101 Switching Protocols\r\n"
       "Upgrade: http/2.0\r\n\r\n"
       "Test Body\r\n");
+
+  handler->sendBody(100);
+  handler->sendEOM();
+  eventBase_.loopOnce();
+  eventBase_.loopOnce();
+  EXPECT_FALSE(transportGood_);
+
   readCallback_->readEOF();
   eventBase_.loop();
-
-  CHECK_EQ(httpSession_->getNumOutgoingStreams(), 0);
-  httpSession_->destroy();
 }
 
 // ===== Upgrade Tests ====
@@ -1902,12 +1983,14 @@ TEST_F(MockHTTP2UpstreamTest, ParseErrorNoTxn) {
   // Expect that the codec should be asked to generate an abort on streamID==1
 
   // Setup the codec expectations.
-  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _))
-      .WillOnce(Invoke([](folly::IOBufQueue& writeBuf,
-                          HTTPCodec::StreamID,
-                          const HTTPMessage&,
-                          bool,
-                          HTTPHeaderSize*) { writeBuf.append("1", 1); }));
+  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _, _))
+      .WillOnce(Invoke(
+          [](folly::IOBufQueue& writeBuf,
+             HTTPCodec::StreamID,
+             const HTTPMessage&,
+             bool,
+             HTTPHeaderSize*,
+             folly::Optional<HTTPHeaders>) { writeBuf.append("1", 1); }));
   EXPECT_CALL(*codecPtr_, generateEOM(_, _)).WillOnce(Return(20));
   EXPECT_CALL(*codecPtr_, generateRstStream(_, 1, _));
 
@@ -2108,13 +2191,15 @@ TEST_F(MockHTTPUpstreamTest, GoawayPreHeaders) {
   InSequence enforceOrder;
 
   handler.expectTransaction();
-  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _))
-      .WillOnce(Invoke(
-          [&](IOBufQueue& writeBuf,
-              HTTPCodec::StreamID /*stream*/,
-              const HTTPMessage& /*msg*/,
-              bool /*eom*/,
-              HTTPHeaderSize* /*size*/) { writeBuf.append("HEADERS", 7); }));
+  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _, _))
+      .WillOnce(Invoke([&](IOBufQueue& writeBuf,
+                           HTTPCodec::StreamID /*stream*/,
+                           const HTTPMessage& /*msg*/,
+                           bool /*eom*/,
+                           HTTPHeaderSize* /*size*/,
+                           folly::Optional<HTTPHeaders>) {
+        writeBuf.append("HEADERS", 7);
+      }));
   handler.expectHeaders([&](std::shared_ptr<HTTPMessage> msg) {
     EXPECT_FALSE(msg->getIsUpgraded());
     EXPECT_EQ(200, msg->getStatusCode());
@@ -2219,7 +2304,7 @@ TEST_F(MockHTTPUpstreamTest, GetWithBody) {
 
   InSequence enforceOrder;
 
-  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _));
+  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _, _));
   EXPECT_CALL(*codecPtr_, generateBody(_, _, _, _, true));
 
   auto txn = httpSession_->newTransaction(&handler);
@@ -2234,7 +2319,7 @@ TEST_F(MockHTTPUpstreamTest, GetWithBody) {
 TEST_F(MockHTTPUpstreamTest, HeaderWithEom) {
   NiceMock<MockHTTPHandler> handler;
   HTTPMessage req = getGetRequest();
-  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, true, _));
+  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, true, _, _));
 
   auto txn = httpSession_->newTransaction(&handler);
   txn->sendHeadersWithEOM(req);
@@ -2266,7 +2351,7 @@ class TestAbortPost : public MockHTTPUpstreamTest {
     std::tie(resp, respBody) = makeResponse(200, 50);
 
     handler.expectTransaction();
-    EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _));
+    EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _, _));
 
     if (stage > 0) {
       handler.expectHeaders();
@@ -2362,7 +2447,7 @@ TEST_F(MockHTTPUpstreamTest, AbortUpgrade) {
   std::unique_ptr<HTTPMessage> resp = makeResponse(200);
 
   handler.expectTransaction();
-  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _));
+  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _, _));
 
   auto txn = httpSession_->newTransaction(&handler);
   const auto streamID = txn->getID();
@@ -2392,7 +2477,7 @@ TEST_F(MockHTTPUpstreamTest, DrainBeforeSendHeaders) {
   MockHTTPHandler pushHandler;
 
   auto handler = openTransaction();
-  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _));
+  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _, _));
 
   handler->expectHeaders();
   handler->expectEOM();
@@ -2650,7 +2735,7 @@ TEST_F(MockHTTP2UpstreamTest, DelayUpstreamWindowUpdate) {
   handler->txn_->setReceiveWindow(1000000); // One miiiillion
 
   InSequence enforceOrder;
-  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _));
+  EXPECT_CALL(*codecPtr_, generateHeader(_, _, _, _, _, _));
   EXPECT_CALL(*codecPtr_, generateWindowUpdate(_, _, _));
 
   HTTPMessage req = getGetRequest();
@@ -2796,7 +2881,7 @@ TEST_F(HTTP2UpstreamSessionTest, AttachDetach) {
     httpSession_->detachThreadLocals();
     httpSession_->attachThreadLocals(
         &base, nullptr, timerInstance, nullptr, fn, nullptr, nullptr);
-    EXPECT_EQ(filterCount, 2);
+    EXPECT_EQ(filterCount, 3);
     filterCount = 0;
     base.loopOnce();
   }
@@ -2862,7 +2947,7 @@ TEST_F(HTTP2UpstreamSessionTest, DetachFlowControlTimeout) {
     httpSession_->detachThreadLocals();
     httpSession_->attachThreadLocals(
         &base, nullptr, timerInstance, nullptr, fn, nullptr, nullptr);
-    EXPECT_EQ(filterCount, 2);
+    EXPECT_EQ(filterCount, 3);
     filterCount = 0;
     base.loopOnce();
   }

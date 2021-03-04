@@ -7,10 +7,25 @@
  */
 
 #include <proxygen/lib/http/codec/HQControlCodec.h>
+
 #include <proxygen/lib/http/HTTP3ErrorCode.h>
+#include <proxygen/lib/http/codec/CodecUtil.h>
 #include <proxygen/lib/http/codec/HQUtils.h>
 
 #include <folly/Random.h>
+
+namespace {
+using namespace proxygen::hq;
+
+uint64_t drainingId(proxygen::TransportDirection dir) {
+  if (dir == proxygen::TransportDirection::DOWNSTREAM) {
+    return kMaxClientBidiStreamId;
+  } else {
+    return kMaxPushId + 1;
+  }
+}
+
+} // namespace
 
 namespace proxygen { namespace hq {
 
@@ -21,7 +36,7 @@ ParseResult HQControlCodec::checkFrameAllowed(FrameType type) {
     case hq::FrameType::DATA:
     case hq::FrameType::HEADERS:
     case hq::FrameType::PUSH_PROMISE:
-      return HTTP3::ErrorCode::HTTP_WRONG_STREAM;
+      return HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED;
     default:
       break;
   }
@@ -33,19 +48,20 @@ ParseResult HQControlCodec::checkFrameAllowed(FrameType type) {
     }
     // multiple SETTINGS frames are not allowed
     if (receivedSettings_ && type == hq::FrameType::SETTINGS) {
-      return HTTP3::ErrorCode::HTTP_UNEXPECTED_FRAME;
-    }
-    // A server MUST treat receipt of a GOAWAY frame as a connection error
-    // of type HTTP_UNEXPECTED_FRAME
-    if (transportDirection_ == TransportDirection::DOWNSTREAM &&
-        type == hq::FrameType::GOAWAY) {
-      return HTTP3::ErrorCode::HTTP_UNEXPECTED_FRAME;
+      return HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED;
     }
     // A client MUST treat the receipt of a MAX_PUSH_ID frame as a connection
-    // error of type HTTP_UNEXPECTED_FRAME
+    // error of type HTTP_FRAME_UNEXPECTED
     if (transportDirection_ == TransportDirection::UPSTREAM &&
         type == hq::FrameType::MAX_PUSH_ID) {
-      return HTTP3::ErrorCode::HTTP_UNEXPECTED_FRAME;
+      return HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED;
+    }
+
+    // PRIORITY_UPDATE is downstream control codec only
+    if (transportDirection_ == TransportDirection::UPSTREAM &&
+        (type == hq::FrameType::PUSH_PRIORITY_UPDATE ||
+         type == hq::FrameType::PRIORITY_UPDATE)) {
+      return HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED;
     }
   }
 
@@ -53,7 +69,7 @@ ParseResult HQControlCodec::checkFrameAllowed(FrameType type) {
   if (getStreamType() == hq::UnidirectionalStreamType::H1Q_CONTROL &&
       (transportDirection_ == TransportDirection::DOWNSTREAM ||
        type != hq::FrameType::GOAWAY)) {
-    return HTTP3::ErrorCode::HTTP_UNEXPECTED_FRAME;
+    return HTTP3::ErrorCode::HTTP_FRAME_UNEXPECTED;
   }
 
   return folly::none;
@@ -76,6 +92,8 @@ ParseResult HQControlCodec::parseSettings(Cursor& cursor,
     return res;
   }
 
+  CHECK(isIngress());
+  auto& ingressSettings = settings_;
   SettingsList settingsList;
   for (auto& setting : outSettings) {
     switch (setting.first) {
@@ -87,8 +105,8 @@ ParseResult HQControlCodec::parseSettings(Cursor& cursor,
         continue; // ignore unknown settings
     }
     auto httpSettingId = hqToHttpSettingsId(setting.first);
-    settings_.setSetting(*httpSettingId, setting.second);
-    settingsList.push_back(*settings_.getSetting(*httpSettingId));
+    ingressSettings.setSetting(*httpSettingId, setting.second);
+    settingsList.push_back(*ingressSettings.getSetting(*httpSettingId));
   }
 
   if (callback_) {
@@ -114,20 +132,75 @@ ParseResult HQControlCodec::parseMaxPushId(Cursor& cursor,
   return res;
 }
 
+ParseResult HQControlCodec::parsePriorityUpdate(Cursor& cursor,
+                                                const FrameHeader& header) {
+  HTTPCodec::StreamID prioritizedElement;
+  HTTPPriority priorityUpdate;
+  auto res = hq::parsePriorityUpdate(
+      cursor, header, prioritizedElement, priorityUpdate);
+  if (!res) {
+    callback_->onPriority(folly::to<quic::StreamId>(prioritizedElement),
+                          priorityUpdate);
+  }
+  return res;
+}
+
+ParseResult HQControlCodec::parsePushPriorityUpdate(Cursor& cursor,
+                                                    const FrameHeader& header) {
+  HTTPCodec::StreamID prioritizedElement;
+  HTTPPriority priorityUpdate;
+  auto res = hq::parsePriorityUpdate(
+      cursor, header, prioritizedElement, priorityUpdate);
+  if (!res) {
+    callback_->onPushPriority(folly::to<PushId>(prioritizedElement),
+                              priorityUpdate);
+  }
+  return res;
+}
+
 bool HQControlCodec::isWaitingToDrain() const {
-  return sentGoaway_;
+  return (!doubleGoaway_ && !sentGoaway_) ||
+         (doubleGoaway_ && sentGoaway_ && !sentFinalGoaway_);
+}
+
+uint64_t HQControlCodec::finalGoawayId() {
+  if (transportDirection_ == TransportDirection::DOWNSTREAM) {
+    return minUnseenStreamID_;
+  } else {
+    return minUnseenPushID_;
+  }
 }
 
 size_t HQControlCodec::generateGoaway(
     folly::IOBufQueue& writeBuf,
-    StreamID lastStream,
-    ErrorCode /*statusCode*/,
+    StreamID minUnseenId,
+    ErrorCode statusCode,
     std::unique_ptr<folly::IOBuf> /*debugData*/) {
-  DCHECK_GE(maxSeenLastStream_, lastStream);
-  maxSeenLastStream_ = lastStream;
-  auto writeRes = hq::writeGoaway(writeBuf, lastStream);
+  if (sentFinalGoaway_) {
+    return 0;
+  }
+  if (minUnseenId == HTTPCodec::MaxStreamID) {
+    if (statusCode != ErrorCode::NO_ERROR || isWaitingToDrain()) {
+      // Non-draining goaway, but the caller didn't know the ID
+      // HQSession doesn't use this path now
+      minUnseenId = finalGoawayId();
+      sentFinalGoaway_ = true;
+    } else {
+      // Draining goaway
+      minUnseenId = drainingId(transportDirection_);
+    }
+  } else {
+    // Non-draining goaway, caller supplied ID
+    sentFinalGoaway_ = true;
+  }
+  VLOG(4) << "generating GOAWAY minUnseenId=" << minUnseenId
+          << " statusCode=" << uint32_t(statusCode);
+
+  DCHECK_GE(egressGoawayAck_, minUnseenId);
+  egressGoawayAck_ = minUnseenId;
+  auto writeRes = hq::writeGoaway(writeBuf, minUnseenId);
   if (writeRes.hasError()) {
-    LOG(FATAL) << "error writing goaway with streamID=" << lastStream;
+    LOG(FATAL) << "error writing goaway with minUnseenId=" << minUnseenId;
     return 0;
   }
   sentGoaway_ = true;
@@ -135,11 +208,10 @@ size_t HQControlCodec::generateGoaway(
 }
 
 size_t HQControlCodec::generateSettings(folly::IOBufQueue& writeBuf) {
-  CHECK(isEgress());
   CHECK(!sentSettings_);
   sentSettings_ = true;
   std::deque<hq::SettingPair> settings;
-  for (auto& setting : settings_.getAllSettings()) {
+  for (auto& setting : getEgressSettings()->getAllSettings()) {
     auto id = httpToHqSettingsId(setting.id);
     // unknown ids will return folly::none
     if (id) {
@@ -168,9 +240,49 @@ size_t HQControlCodec::generateSettings(folly::IOBufQueue& writeBuf) {
 size_t HQControlCodec::generatePriority(
     folly::IOBufQueue& /*writeBuf*/,
     StreamID /*stream*/,
-    const HTTPMessage::HTTPPriority& /*pri*/) {
-  CHECK(false) << __func__ << "not implemented yet";
+    const HTTPMessage::HTTP2Priority& /*pri*/) {
+  CHECK(false) << __func__
+               << " deprecated draft. Use the other generatePriority API";
   return 0;
+}
+
+size_t HQControlCodec::generatePriority(folly::IOBufQueue& writeBuf,
+                                        StreamID stream,
+                                        HTTPPriority priority) {
+  if (priority.urgency > quic::kDefaultMaxPriority) {
+    LOG(ERROR) << "Attempt to generate invalid priority update with urgency="
+               << (uint64_t)priority.urgency;
+    return 0;
+  }
+  std::string updateString = folly::to<std::string>(
+      "u=", priority.urgency, (priority.incremental ? ",i" : ""));
+  auto writeRet = hq::writePriorityUpdate(writeBuf, stream, updateString);
+  if (writeRet.hasError()) {
+    LOG(ERROR) << "error writing priority update, stream=" << stream
+               << ", priority=" << updateString;
+    return 0;
+  }
+  return *writeRet;
+}
+
+size_t HQControlCodec::generatePushPriority(folly::IOBufQueue& writeBuf,
+                                            StreamID pushId,
+                                            HTTPPriority priority) {
+  if (priority.urgency > quic::kDefaultMaxPriority) {
+    LOG(ERROR)
+        << "Attempt to generate invalid push priority update with urgency="
+        << (uint64_t)priority.urgency;
+    return 0;
+  }
+  std::string updateString = folly::to<std::string>(
+      "u=", priority.urgency, (priority.incremental ? ",i" : ""));
+  auto writeRet = hq::writePushPriorityUpdate(writeBuf, pushId, updateString);
+  if (writeRet.hasError()) {
+    LOG(ERROR) << "error writing push priority update, pushId=" << pushId
+               << ", priority=" << updateString;
+    return 0;
+  }
+  return *writeRet;
 }
 
 size_t HQControlCodec::addPriorityNodes(PriorityQueue& /*queue*/,

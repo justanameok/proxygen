@@ -7,6 +7,7 @@
  */
 
 #include <proxygen/lib/http/session/HTTPSessionAcceptor.h>
+
 #include <proxygen/lib/http/codec/HTTP1xCodec.h>
 #include <proxygen/lib/http/codec/HTTP2Codec.h>
 #include <proxygen/lib/http/session/HTTPDefaultSessionCodecFactory.h>
@@ -64,6 +65,10 @@ void HTTPSessionAcceptor::onNewConnection(folly::AsyncTransport::UniquePtr sock,
     VLOG(2) << "codecFactory_ failed to provide codec";
     onSessionCreationError(ProxygenError::kErrorUnsupportedScheme);
     return;
+  }
+  auto egressSettings = codec->getEgressSettings();
+  if (egressSettings && setEnableConnectProtocol_) {
+    egressSettings->setSetting(SettingsId::ENABLE_CONNECT_PROTOCOL, 1);
   }
 
   auto controller = getController();
